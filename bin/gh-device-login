@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+# gh-device-login — Authenticate with GitHub via device-flow and export GH_TOKEN.
+#
+# Designed for remote multi-user systems where storing tokens on disk is
+# undesirable.  The token is written only to the environment of the spawned
+# shell (or eval'd into the calling shell) and never touches the filesystem.
+#
+# How it works:
+#   1. Request a device code from GitHub's OAuth device-flow endpoint.
+#   2. Prompt the user to visit the GitHub URL and enter the displayed code.
+#   3. Poll GitHub until the user completes authorisation (or until the code
+#      expires / the user cancels).
+#   4. Print an eval-able export statement, or exec a given command with
+#      GH_TOKEN set in its environment.
+#
+# Usage:
+#   # Export into the current shell (eval pattern):
+#   eval "$(gh-device-login)"
+#
+#   # Run a single command with the token in its environment:
+#   gh-device-login --exec gh repo list
+#
+#   # Spawn an interactive sub-shell with GH_TOKEN set:
+#   gh-device-login --shell
+#
+#   # Use a custom GitHub OAuth App client-id:
+#   gh-device-login --client-id <YOUR_CLIENT_ID>
+#
+# Options:
+#   --help, -h           Show this help text and exit.
+#   --client-id ID       GitHub OAuth App client ID to use.
+#                        Defaults to the well-known gh CLI client ID.
+#   --scope SCOPE        OAuth scopes to request (comma-separated).
+#                        Default: repo,read:org,gist,read:packages
+#   --exec CMD [ARGS…]   Run CMD with GH_TOKEN set; all remaining arguments
+#                        are passed to CMD verbatim.  This flag must come last.
+#   --shell              Spawn $SHELL (or /bin/bash) with GH_TOKEN exported.
+#   --dry-run            Print what would be done without contacting GitHub.
+#   --verbose            Print polling progress to stderr.
+#
+# Security notes:
+#   - The token is never written to disk.
+#   - When using eval "$(gh-device-login)" the token exists only in the
+#     current shell's memory; it is lost when that shell exits.
+#   - The client ID embedded here is the public well-known ID used by the
+#     official gh CLI; it has no special privileges beyond what you authorise.
+#
+# Requires: bash >= 4.0, curl, jq
+
+set -euo pipefail
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+# The well-known OAuth client ID used by the official GitHub CLI (gh).
+# It is a *public* identifier — not a secret.  Device-flow requires no secret.
+readonly DEFAULT_CLIENT_ID="178c6fc778ccc68e1d6a"
+
+readonly DEVICE_CODE_URL="https://github.com/login/device/code"
+readonly ACCESS_TOKEN_URL="https://github.com/login/oauth/access_token"
+readonly DEFAULT_SCOPE="repo,read:org,gist,read:packages"
+
+# Minimum poll interval imposed by GitHub (seconds).
+readonly MIN_POLL_INTERVAL=5
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+usage() {
+    sed -n '/^# Usage:/,/^# Requires:/{ /^# Requires:/d; s/^# \{0,1\}//; p }' "$0" >&2
+}
+
+die() {
+    echo "gh-device-login: error: $*" >&2
+    exit 1
+}
+
+require_cmd() {
+    local cmd="$1"
+    command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required but not found in PATH"
+}
+
+# Print to stderr only when --verbose is active.
+log() {
+    [[ "${VERBOSE:-0}" -eq 1 ]] && echo "gh-device-login: $*" >&2 || true
+}
+
+# ── Device-flow implementation ─────────────────────────────────────────────────
+
+# Step 1 – request device + user code pair.
+request_device_code() {
+    local client_id="$1"
+    local scope="$2"
+
+    local response
+    response=$(curl --silent --fail \
+        --header "Accept: application/json" \
+        --data-urlencode "client_id=${client_id}" \
+        --data-urlencode "scope=${scope}" \
+        "${DEVICE_CODE_URL}") || die "Failed to contact GitHub device code endpoint."
+
+    echo "$response"
+}
+
+# Step 2 – poll for the access token.
+poll_for_token() {
+    local client_id="$1"
+    local device_code="$2"
+    local interval="$3"
+    local expires_in="$4"
+
+    local elapsed=0
+    local token=""
+
+    while true; do
+        sleep "$interval"
+        elapsed=$(( elapsed + interval ))
+
+        if [[ "$elapsed" -ge "$expires_in" ]]; then
+            die "Device code expired.  Please run gh-device-login again."
+        fi
+
+        local response
+        response=$(curl --silent \
+            --header "Accept: application/json" \
+            --data-urlencode "client_id=${client_id}" \
+            --data-urlencode "device_code=${device_code}" \
+            --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
+            "${ACCESS_TOKEN_URL}") || die "Failed to contact GitHub token endpoint."
+
+        local error access_token _jq_out
+        _jq_out=$(echo "$response" | jq --raw-output '[.error // "", .access_token // ""] | @tsv')
+        IFS=$'\t' read -r error access_token <<< "${_jq_out}"
+
+        case "$error" in
+            authorization_pending)
+                log "Waiting for authorisation… (${elapsed}s elapsed)"
+                ;;
+            slow_down)
+                # GitHub asked us to slow down; increase interval permanently.
+                interval=$(( interval + 5 ))
+                [[ "$interval" -lt "$MIN_POLL_INTERVAL" ]] && interval=$MIN_POLL_INTERVAL
+                log "Rate-limited — increasing poll interval to ${interval}s"
+                ;;
+            expired_token)
+                die "Device code expired.  Please run gh-device-login again."
+                ;;
+            access_denied)
+                die "Authorisation denied by user."
+                ;;
+            "")
+                # No error field — check for a token.
+                if [[ -n "$access_token" ]]; then
+                    token="$access_token"
+                    break
+                else
+                    die "Unexpected response from GitHub: $response"
+                fi
+                ;;
+            *)
+                die "Unexpected error from GitHub: $error — $response"
+                ;;
+        esac
+    done
+
+    echo "$token"
+}
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+main() {
+    local client_id="${DEFAULT_CLIENT_ID}"
+    local scope="${DEFAULT_SCOPE}"
+    local mode="eval"          # eval | exec | shell
+    local dry_run=0
+    VERBOSE=0
+    local exec_args=()
+
+    # ── Argument parsing ───────────────────────────────────────────────────────
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            --client-id)
+                [[ $# -lt 2 ]] && die "--client-id requires an argument"
+                client_id="$2"
+                shift 2
+                ;;
+            --scope)
+                [[ $# -lt 2 ]] && die "--scope requires an argument"
+                scope="$2"
+                shift 2
+                ;;
+            --dry-run)
+                dry_run=1
+                shift
+                ;;
+            --verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --shell)
+                mode="shell"
+                shift
+                ;;
+            --exec)
+                mode="exec"
+                shift
+                # Everything remaining is the command + its arguments.
+                exec_args=("$@")
+                break
+                ;;
+            -*)
+                die "Unknown option: $1 (try --help)"
+                ;;
+            *)
+                die "Unexpected argument: $1 (try --help)"
+                ;;
+        esac
+    done
+
+    if [[ "$mode" == "exec" && "${#exec_args[@]}" -eq 0 ]]; then
+        die "--exec requires at least one command argument"
+    fi
+
+    # ── Dry-run early exit ─────────────────────────────────────────────────────
+    if [[ "$dry_run" -eq 1 ]]; then
+        echo "gh-device-login: dry-run mode" >&2
+        echo "  client_id : ${client_id}" >&2
+        echo "  scope     : ${scope}" >&2
+        echo "  mode      : ${mode}" >&2
+        if [[ "$mode" == "exec" ]]; then
+            echo "  command   : ${exec_args[*]}" >&2
+        fi
+        echo "" >&2
+        echo "Would request a device code from: ${DEVICE_CODE_URL}" >&2
+        echo "Would poll for token at:          ${ACCESS_TOKEN_URL}" >&2
+        exit 0
+    fi
+
+    # ── Dependency checks ──────────────────────────────────────────────────────
+    require_cmd curl
+    require_cmd jq
+
+    # ── Step 1: request device code ───────────────────────────────────────────
+    log "Requesting device code…"
+    local device_response
+    device_response=$(request_device_code "$client_id" "$scope")
+
+    local user_code verification_uri device_code expires_in interval
+    user_code=$(echo       "$device_response" | jq --raw-output '.user_code')
+    verification_uri=$(echo "$device_response" | jq --raw-output '.verification_uri')
+    device_code=$(echo     "$device_response" | jq --raw-output '.device_code')
+    expires_in=$(echo      "$device_response" | jq --raw-output '.expires_in')
+    interval=$(echo        "$device_response" | jq --raw-output '.interval')
+
+    # Enforce the minimum poll interval.
+    if [[ "$interval" -lt "$MIN_POLL_INTERVAL" ]]; then
+        interval=$MIN_POLL_INTERVAL
+    fi
+
+    # ── Step 2: prompt the user ────────────────────────────────────────────────
+    # All prompts go to stderr so that eval "$(gh-device-login)" only captures
+    # the export statement on stdout.
+
+    # Build the dynamic-width box.
+    local title="GitHub Device Authorisation"
+    local line1="1. Open: ${verification_uri}"
+    local line2="2. Enter code: ${user_code}"
+    local line3="(Code expires in ${expires_in} seconds)"
+
+    # Compute inner width: max of content lines + padding, and wide enough for title.
+    local max_content_len=0
+    local len
+    for line in "$line1" "$line2" "$line3"; do
+        len=${#line}
+        [[ $len -gt $max_content_len ]] && max_content_len=$len
+    done
+
+    local inner_width=$(( max_content_len + 4 ))  # 2-space padding each side
+    local title_width=$(( ${#title} + 2 ))
+    [[ $title_width -gt $inner_width ]] && inner_width=$title_width
+
+    # Helper to repeat a character N times.
+    _repeat() { printf "%${1}s" | tr ' ' "$2"; }
+
+    # Top border
+    echo "" >&2
+    printf "┌%s┐\n" "$(_repeat $inner_width ─)" >&2
+
+    # Title row (centered)
+    local title_pad=$(( (inner_width - ${#title}) / 2 ))
+    local title_pad_right=$(( inner_width - ${#title} - title_pad ))
+    printf "│%s%s%s│\n" "$(_repeat $title_pad ' ')" "$title" "$(_repeat $title_pad_right ' ')" >&2
+
+    # Divider
+    printf "├%s┤\n" "$(_repeat $inner_width ─)" >&2
+
+    # Content lines (left-aligned with 2-space padding)
+    printf "│  %-$(( inner_width - 2 ))s│\n" "$line1" >&2
+    printf "│  %-$(( inner_width - 2 ))s│\n" "$line2" >&2
+    printf "│  %-$(( inner_width - 2 ))s│\n" "$line3" >&2
+
+    # Bottom border
+    printf "└%s┘\n" "$(_repeat $inner_width ─)" >&2
+    echo "" >&2
+
+    # ── Step 3: poll for the token ─────────────────────────────────────────────
+    log "Polling for authorisation (interval: ${interval}s)…"
+    local token
+    token=$(poll_for_token "$client_id" "$device_code" "$interval" "$expires_in")
+
+    echo "" >&2
+    echo "gh-device-login: authorisation successful." >&2
+    echo "" >&2
+
+    # ── Step 4: deliver the token ──────────────────────────────────────────────
+    case "$mode" in
+        eval)
+            # Print an eval-able line to stdout; everything else went to stderr.
+            printf 'export GH_TOKEN=%q\n' "$token"
+            echo "# Run:  eval \"\$(gh-device-login)\"  to import this into your shell." >&2
+            ;;
+        shell)
+            local login_shell="${SHELL:-/bin/bash}"
+            echo "gh-device-login: spawning ${login_shell} with GH_TOKEN set." >&2
+            echo "gh-device-login: GH_TOKEN will be lost when this shell exits." >&2
+            GH_TOKEN="$token" exec "$login_shell"
+            ;;
+        exec)
+            GH_TOKEN="$token" exec "${exec_args[@]}"
+            ;;
+    esac
+}
+
+main "$@"
