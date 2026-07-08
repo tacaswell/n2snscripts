@@ -477,7 +477,7 @@ build_codex_home_mount() {
         # contents into a plain file (not a mount point), so Codex's temp-file
         # + rename succeeds.  Writes live only in the tmpfs and are discarded
         # on exit, leaving the host config.toml untouched.
-        exec {_CFG_FD}<"${CODEX_CONFIG_FILE}"
+        exec {_CFG_FD}< "${CODEX_CONFIG_FILE}"
         BWRAP_ARGS+=(--file "${_CFG_FD}" "${CODEX_CONFIG_FILE}")
     fi
 
