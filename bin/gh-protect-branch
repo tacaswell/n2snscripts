@@ -23,25 +23,58 @@
 #   Repository settings:
 #   - Secret scanning and push protection enabled
 #
+#   Repository ruleset "nsls2-restrict-branch-creation" (optional):
+#   - Blocks creation of branches whose names do not match the excluded patterns
+#   - Excluded (allowed) patterns are supplied via --exclude-branches (CSV)
+#   - Applied additively alongside full protection (--restrict-branch-creation)
+#     or as the only change to the repo (--only-restrict-creation)
+#
 # Requires:
 #   - gh(1) authenticated with admin:repo scope on the target repository
+#   - read:org scope when using --approvers (GitHub team API requirement)
 #
 # Usage:
-#   gh-protect-branch [--approvers <team-slug>] [--no-sign-commits] <owner/repo> [branch]
+#   gh-protect-branch [--approvers <team-slug>] [--no-sign-commits]
+#                     [--restrict-branch-creation [--exclude-branches <csv>]]
+#                     <owner/repo> [branch]
+#   gh-protect-branch --only-restrict-creation [--exclude-branches <csv>]
+#                     <owner/repo>
 #   gh-protect-branch --help
+#
+# Options:
+#   --approvers <team-slug>    Restrict stale-review dismissal to this team.
+#                              The team must exist in the repo's org; the script
+#                              validates this before applying any protection.
+#   --no-sign-commits          Do not require signed commits.
+#   --restrict-branch-creation Apply the creation-restriction ruleset in
+#                              addition to full branch protection.
+#   --only-restrict-creation   Apply only the creation-restriction ruleset;
+#                              skip full branch protection, classic rules,
+#                              and secret-scanning changes.
+#                              Incompatible with --approvers and --no-sign-commits.
+#   --exclude-branches <csv>   Comma-separated list of fnmatch branch-name
+#                              patterns to allow creation of.  Each entry is
+#                              matched against refs/heads/<pattern>.
+#                              Default: main,preview
+#                              Requires --restrict-branch-creation or
+#                              --only-restrict-creation.
 #
 # Examples:
 #   gh-protect-branch NSLS2/n2snscripts
 #   gh-protect-branch NSLS2/n2sndocs main
 #   gh-protect-branch --approvers n2sn-admins NSLS2/n2snscripts
-#   gh-protect-branch --approvers n2sn-admins NSLS2/n2sndocs main
 #   gh-protect-branch --no-sign-commits NSLS2/n2snscripts
+#   gh-protect-branch --restrict-branch-creation NSLS2/n2sndocs
+#   gh-protect-branch --restrict-branch-creation \
+#       --exclude-branches main,preview,release/** NSLS2/n2sndocs
+#   gh-protect-branch --only-restrict-creation \
+#       --exclude-branches main,preview NSLS2/n2sndocs
 #
 # Exit codes:
 #   0  success
-#   1  usage error or missing dependency
+#   1  usage error or missing dependency (including team not found / read:org)
 #   2  gh not authenticated
-#   3  API call failed
+#   non-zero  gh API call failed (exit code from gh; typically 1)
 
 set -euo pipefail
 
@@ -50,7 +83,8 @@ if ((BASH_VERSINFO[0] < 4)); then
     exit 1
 fi
 
-RULESET_NAME="nsls2-branch-protection"
+FULL_RULESET_NAME="nsls2-branch-protection"
+CREATION_RULESET_NAME="nsls2-restrict-branch-creation"
 
 show_help() {
     sed -n '2,/^$/{ s/^# \{0,1\}//; p; }' "$0"
@@ -58,6 +92,10 @@ show_help() {
 
 APPROVERS_TEAM=""
 SIGN_COMMITS="true"
+RESTRICT_CREATION="false"
+ONLY_RESTRICT_CREATION="false"
+EXCLUDE_CSV="main,preview"
+EXCLUDE_CSV_SET="false"
 
 while [[ "${1:-}" == -* ]]; do
     case "$1" in
@@ -77,6 +115,23 @@ while [[ "${1:-}" == -* ]]; do
             SIGN_COMMITS="false"
             shift
             ;;
+        --restrict-branch-creation)
+            RESTRICT_CREATION="true"
+            shift
+            ;;
+        --only-restrict-creation)
+            ONLY_RESTRICT_CREATION="true"
+            shift
+            ;;
+        --exclude-branches)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --exclude-branches requires a comma-separated list of patterns." >&2
+                exit 1
+            fi
+            EXCLUDE_CSV="$2"
+            EXCLUDE_CSV_SET="true"
+            shift 2
+            ;;
         *)
             echo "Error: unknown option: $1" >&2
             show_help
@@ -84,6 +139,32 @@ while [[ "${1:-}" == -* ]]; do
             ;;
     esac
 done
+
+# ── Validate flag combinations ─────────────────────────────────────────────────
+
+if [[ "${RESTRICT_CREATION}" == "true" && "${ONLY_RESTRICT_CREATION}" == "true" ]]; then
+    echo "Error: --restrict-branch-creation and --only-restrict-creation are mutually exclusive." >&2
+    exit 1
+fi
+
+if [[ "${ONLY_RESTRICT_CREATION}" == "true" && -n "${APPROVERS_TEAM}" ]]; then
+    echo "Error: --only-restrict-creation is incompatible with --approvers." >&2
+    exit 1
+fi
+
+if [[ "${ONLY_RESTRICT_CREATION}" == "true" && "${SIGN_COMMITS}" == "false" ]]; then
+    echo "Error: --only-restrict-creation is incompatible with --no-sign-commits." >&2
+    exit 1
+fi
+
+if [[ "${EXCLUDE_CSV_SET}" == "true" &&
+       "${RESTRICT_CREATION}" == "false" &&
+       "${ONLY_RESTRICT_CREATION}" == "false" ]]; then
+    echo "Error: --exclude-branches requires --restrict-branch-creation or --only-restrict-creation." >&2
+    exit 1
+fi
+
+# ── Positional arguments ───────────────────────────────────────────────────────
 
 if [[ -z "${1:-}" ]]; then
     show_help
@@ -99,6 +180,8 @@ if [[ ! "${REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
     exit 1
 fi
 
+# ── Dependency + auth checks ───────────────────────────────────────────────────
+
 command -v gh > /dev/null || {
     echo "Error: gh CLI not found in PATH." >&2
     exit 1
@@ -108,18 +191,60 @@ gh auth status > /dev/null 2>&1 || {
     exit 2
 }
 
-echo "Applying branch protection to ${REPO}@${BRANCH}..."
+# ── Validate --approvers team exists in the org ────────────────────────────────
+# Note: the GitHub team API (orgs/{org}/teams/{slug}) requires read:org scope
+# in addition to admin:repo.  A 404 may mean the team does not exist OR that
+# the token lacks read:org; the error message covers both cases.
 
-# Build the rules array for the ruleset. Signed commits are conditional.
-if [[ "${SIGN_COMMITS}" == "true" ]]; then
-    SIGN_RULE=',
-    { "type": "required_signatures" }'
-else
-    SIGN_RULE=''
+if [[ -n "${APPROVERS_TEAM}" ]]; then
+    ORG="${REPO%%/*}"
+    if ! gh api "orgs/${ORG}/teams/${APPROVERS_TEAM}" > /dev/null 2>&1; then
+        echo "Error: team '${APPROVERS_TEAM}' not found in org '${ORG}'," >&2
+        echo "       or gh token lacks read:org scope required by the team API." >&2
+        exit 1
+    fi
 fi
 
-# Compose the ruleset payload (used for both create and update).
-RULESET_PAYLOAD=$(printf '{
+# ── Build the creation-restriction ruleset exclude JSON ───────────────────────
+# Each CSV entry is trimmed and prefixed with refs/heads/ so bare names like
+# "main" match correctly.  fnmatch patterns (e.g. release/**) are preserved.
+
+_build_exclude_json() {
+    local csv="$1"
+    local result=""
+    local p
+    IFS=',' read -ra _pats <<< "${csv}"
+    for p in "${_pats[@]}"; do
+        # trim leading/trailing whitespace
+        p="${p#"${p%%[![:space:]]*}"}"
+        p="${p%"${p##*[![:space:]]}"}"
+        [[ -z "$p" ]] && continue
+        result+="${result:+, }\"refs/heads/${p}\""
+    done
+    if [[ -z "${result}" ]]; then
+        echo "Error: --exclude-branches produced no usable patterns after trimming." >&2
+        echo "       At least one non-empty branch name or pattern is required." >&2
+        exit 1
+    fi
+    printf '%s' "${result}"
+}
+
+# ── Full branch protection (steps 1–4) ────────────────────────────────────────
+# Skipped when --only-restrict-creation is set.
+
+if [[ "${ONLY_RESTRICT_CREATION}" == "false" ]]; then
+    echo "Applying branch protection to ${REPO}@${BRANCH}..."
+
+    # Build the rules array.  Signed commits are conditional.
+    if [[ "${SIGN_COMMITS}" == "true" ]]; then
+        SIGN_RULE=',
+    { "type": "required_signatures" }'
+    else
+        SIGN_RULE=''
+    fi
+
+    # Compose the ruleset payload (used for both create and update).
+    RULESET_PAYLOAD=$(printf '{
   "name": "%s",
   "target": "branch",
   "enforcement": "active",
@@ -143,38 +268,38 @@ RULESET_PAYLOAD=$(printf '{
       }
     }%s
   ]
-}' "${RULESET_NAME}" "${SIGN_RULE}")
+}' "${FULL_RULESET_NAME}" "${SIGN_RULE}")
 
-# 1) Repository ruleset (all branches via ~ALL) — idempotent.
-#    Check for an existing ruleset with our name; PUT if found, POST if not.
-RULESET_ID=$(gh api "repos/${REPO}/rulesets" \
-    --jq ".[] | select(.name==\"${RULESET_NAME}\") | .id" 2> /dev/null || true)
+    # 1) Repository ruleset (all branches via ~ALL) — idempotent.
+    #    Check for an existing ruleset with our name; PUT if found, POST if not.
+    RULESET_ID=$(gh api "repos/${REPO}/rulesets" \
+        --jq ".[] | select(.name==\"${FULL_RULESET_NAME}\") | .id" 2> /dev/null || true)
 
-if [[ -n "${RULESET_ID}" ]]; then
-    printf '%s' "${RULESET_PAYLOAD}" |
-        gh api -X PUT "repos/${REPO}/rulesets/${RULESET_ID}" \
-            -H "Accept: application/vnd.github+json" \
-            --input - > /dev/null
-    RULESET_ACTION="updated"
-else
-    printf '%s' "${RULESET_PAYLOAD}" |
-        gh api -X POST "repos/${REPO}/rulesets" \
-            -H "Accept: application/vnd.github+json" \
-            --input - > /dev/null
-    RULESET_ACTION="created"
-fi
+    if [[ -n "${RULESET_ID}" ]]; then
+        printf '%s' "${RULESET_PAYLOAD}" |
+            gh api -X PUT "repos/${REPO}/rulesets/${RULESET_ID}" \
+                -H "Accept: application/vnd.github+json" \
+                --input - > /dev/null
+        RULESET_ACTION="updated"
+    else
+        printf '%s' "${RULESET_PAYLOAD}" |
+            gh api -X POST "repos/${REPO}/rulesets" \
+                -H "Accept: application/vnd.github+json" \
+                --input - > /dev/null
+        RULESET_ACTION="created"
+    fi
 
-# 2) Classic named-branch protection — enforce_admins + optional dismissal restrictions.
-#    The Ruleset covers the substantive rules for all branches; the classic rule
-#    adds admin enforcement on the named branch and (when --approvers is set)
-#    restricts who can dismiss stale reviews to the named team.
-if [[ -n "${APPROVERS_TEAM}" ]]; then
-    DISMISSAL_JSON='"dismissal_restrictions": { "teams": ["'"${APPROVERS_TEAM}"'"] },'
-else
-    DISMISSAL_JSON=''
-fi
+    # 2) Classic named-branch protection — enforce_admins + optional dismissal
+    #    restrictions.  The Ruleset covers the substantive rules for all
+    #    branches; the classic rule adds admin enforcement on the named branch
+    #    and (when --approvers is set) restricts who can dismiss stale reviews.
+    if [[ -n "${APPROVERS_TEAM}" ]]; then
+        DISMISSAL_JSON='"dismissal_restrictions": { "teams": ["'"${APPROVERS_TEAM}"'"] },'
+    else
+        DISMISSAL_JSON=''
+    fi
 
-printf '{
+    printf '{
   "required_status_checks": null,
   "enforce_admins": true,
   "required_pull_request_reviews": {
@@ -187,41 +312,89 @@ printf '{
   "restrictions": null,
   "required_conversation_resolution": true
 }' "${DISMISSAL_JSON}" |
-    gh api -X PUT "repos/${REPO}/branches/${BRANCH}/protection" \
-        -H "Accept: application/vnd.github+json" \
-        --input - > /dev/null
+        gh api -X PUT "repos/${REPO}/branches/${BRANCH}/protection" \
+            -H "Accept: application/vnd.github+json" \
+            --input - > /dev/null
 
-# 3) Belt-and-suspenders signed commits on the named branch via classic API.
-#    The Ruleset already requires signed commits on ~ALL branches, but the classic
-#    required_signatures endpoint provides an additional enforcement layer on the
-#    named branch.
-if [[ "${SIGN_COMMITS}" == "true" ]]; then
-    gh api -X POST "repos/${REPO}/branches/${BRANCH}/protection/required_signatures" \
-        -H "Accept: application/vnd.github+json" > /dev/null
-fi
+    # 3) Belt-and-suspenders signed commits on the named branch via classic API.
+    #    The Ruleset already requires signed commits on ~ALL branches, but the
+    #    classic required_signatures endpoint adds an enforcement layer on the
+    #    named branch.
+    if [[ "${SIGN_COMMITS}" == "true" ]]; then
+        gh api -X POST \
+            "repos/${REPO}/branches/${BRANCH}/protection/required_signatures" \
+            -H "Accept: application/vnd.github+json" > /dev/null
+    fi
 
-# 4) Secret scanning + push protection (repository-level)
-printf '{
+    # 4) Secret scanning + push protection (repository-level).
+    printf '{
   "security_and_analysis": {
     "secret_scanning": { "status": "enabled" },
     "secret_scanning_push_protection": { "status": "enabled" }
   }
 }' | gh api -X PATCH "repos/${REPO}" \
-      -H "Accept: application/vnd.github+json" \
-      --input - > /dev/null
+          -H "Accept: application/vnd.github+json" \
+          --input - > /dev/null
 
-echo "Done. ${REPO}@${BRANCH} protected:"
-echo "  - Ruleset '${RULESET_NAME}' ${RULESET_ACTION} (all branches via ~ALL)"
-echo "    PR + 1 approval + last-push + CODEOWNERS + conversation resolution"
-echo "    + deletion blocked + force-push blocked"
-if [[ "${SIGN_COMMITS}" == "true" ]]; then
-    echo "    + signed commits required"
+    echo "Done. ${REPO}@${BRANCH} protected:"
+    echo "  - Ruleset '${FULL_RULESET_NAME}' ${RULESET_ACTION} (all branches via ~ALL)"
+    echo "    PR + 1 approval + last-push + CODEOWNERS + conversation resolution"
+    echo "    + deletion blocked + force-push blocked"
+    if [[ "${SIGN_COMMITS}" == "true" ]]; then
+        echo "    + signed commits required"
+    fi
+    echo "  - Classic protection on ${BRANCH}: admins enforced"
+    if [[ -n "${APPROVERS_TEAM}" ]]; then
+        echo "    + stale-review dismissal restricted to team '${APPROVERS_TEAM}'"
+    fi
+    if [[ "${SIGN_COMMITS}" == "true" ]]; then
+        echo "    + signed commits required on ${BRANCH}"
+    fi
+    echo "  - Secret scanning and push protection enabled"
 fi
-echo "  - Classic protection on ${BRANCH}: admins enforced"
-if [[ -n "${APPROVERS_TEAM}" ]]; then
-    echo "    + stale-review dismissal restricted to team '${APPROVERS_TEAM}'"
+
+# ── Creation-restriction ruleset (step 5) ─────────────────────────────────────
+# Applied when --restrict-branch-creation or --only-restrict-creation is set.
+
+if [[ "${RESTRICT_CREATION}" == "true" || "${ONLY_RESTRICT_CREATION}" == "true" ]]; then
+    EXCLUDE_JSON=$(_build_exclude_json "${EXCLUDE_CSV}")
+
+    CREATION_PAYLOAD=$(printf '{
+  "name": "%s",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["~ALL"],
+      "exclude": [%s]
+    }
+  },
+  "rules": [
+    { "type": "creation" }
+  ]
+}' "${CREATION_RULESET_NAME}" "${EXCLUDE_JSON}")
+
+    CREATION_RULESET_ID=$(gh api "repos/${REPO}/rulesets" \
+        --jq ".[] | select(.name==\"${CREATION_RULESET_NAME}\") | .id" \
+        2> /dev/null || true)
+
+    if [[ -n "${CREATION_RULESET_ID}" ]]; then
+        printf '%s' "${CREATION_PAYLOAD}" |
+            gh api -X PUT "repos/${REPO}/rulesets/${CREATION_RULESET_ID}" \
+                -H "Accept: application/vnd.github+json" \
+                --input - > /dev/null
+        CREATION_ACTION="updated"
+    else
+        printf '%s' "${CREATION_PAYLOAD}" |
+            gh api -X POST "repos/${REPO}/rulesets" \
+                -H "Accept: application/vnd.github+json" \
+                --input - > /dev/null
+        CREATION_ACTION="created"
+    fi
+
+    if [[ "${ONLY_RESTRICT_CREATION}" == "true" ]]; then
+        echo "Done. ${REPO} creation restricted:"
+    fi
+    echo "  - Ruleset '${CREATION_RULESET_NAME}' ${CREATION_ACTION}"
+    echo "    Branch creation blocked except: ${EXCLUDE_CSV}"
 fi
-if [[ "${SIGN_COMMITS}" == "true" ]]; then
-    echo "    + signed commits required on ${BRANCH}"
-fi
-echo "  - Secret scanning and push protection enabled"

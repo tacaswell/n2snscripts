@@ -23,7 +23,7 @@ docs/   Per-script and per-library documentation
 | `bwcodex` | OpenAI Codex CLI in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwcopilot` | GitHub Copilot CLI in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwopencode` | OpenCode in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
-| `gh-protect-branch` | Apply NSLS-II standard branch protection to a GitHub repo (all branches); enables secret scanning and push protection | [docs/gh-protect-branch.md](docs/gh-protect-branch.md) |
+| `gh-protect-branch` | Apply NSLS-II standard branch protection to a GitHub repo (all branches); enables secret scanning and push protection; optionally restricts branch creation to named patterns | [docs/gh-protect-branch.md](docs/gh-protect-branch.md) |
 | `pemdecompose` | List and verify certificates in a PEM file | [docs/pemdecompose.md](docs/pemdecompose.md) |
 
 All `bw*` wrappers share `lib/bwrap_sandbox_lib.sh` for sandbox construction.
@@ -98,6 +98,42 @@ Common wrapper options:
 
 `bwclaude` also supports `--debug`. See each script's `--help` for the
 authoritative option list.
+
+### `gh-protect-branch`
+
+Apply NSLS-II standard branch protection to a GitHub repository. Enforces
+PR reviews, signed commits, deletion and force-push blocking, and secret
+scanning via a repository ruleset and a named-branch classic protection
+rule. Optionally restricts who can create new branches.
+
+```text
+gh-protect-branch [--approvers <team-slug>] [--no-sign-commits]
+                  [--restrict-branch-creation [--exclude-branches <csv>]]
+                  <owner/repo> [branch]
+gh-protect-branch --only-restrict-creation [--exclude-branches <csv>]
+                  <owner/repo>
+```
+
+| Option | Effect |
+| --- | --- |
+| `--approvers <team-slug>` | Restrict stale-review dismissal to this team (team must exist in the org) |
+| `--no-sign-commits` | Do not require signed commits |
+| `--restrict-branch-creation` | Also apply a creation-restriction ruleset (additive) |
+| `--only-restrict-creation` | Apply only the creation-restriction ruleset; skip full protection |
+| `--exclude-branches <csv>` | Comma-separated fnmatch patterns allowed to be created (default: `main,preview`); requires `--restrict-branch-creation` or `--only-restrict-creation` |
+| `<owner/repo>` | Repository in `owner/repo` format (required) |
+| `[branch]` | Named branch for classic protection (default: `main`) |
+| `-h`, `--help` | Show help and exit |
+
+```bash
+gh-protect-branch NSLS2/n2sndocs
+gh-protect-branch --approvers n2sn-admins NSLS2/n2sndocs main
+gh-protect-branch --only-restrict-creation \
+    --exclude-branches main,preview NSLS2/n2sndocs
+```
+
+Exit codes: `0` success, `1` usage error or missing dependency,
+`2` `gh` not authenticated, non-zero `gh` exit code on API failure.
 
 ### `gpg-passwd.sh`
 
