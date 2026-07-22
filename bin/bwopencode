@@ -12,7 +12,7 @@
 #   - OpenCode data dir: ephemeral tmpfs with selective persistence
 #       - auth.json: persisted only if it already exists on host;
 #         otherwise created in tmpfs (discarded on exit)
-#       - Database, logs, snapshots, storage, tool-output,
+#       - Database, logs, plans, snapshots, storage, tool-output,
 #         project-dotfiles: always persisted
 #   - OpenCode cache: read-write
 #   - Git config + includes: read-only
@@ -215,6 +215,10 @@ resolve_opencode_paths() {
     # in resolve_common_paths; checking the opencode subdirs covers the case
     # where someone has set those XDG vars to a parent of a blocked path and
     # 'opencode' happens to be a path component that lands inside the block.
+    # OC_CONFIG_DIR is checked here so that a symlinked ~/.config/opencode
+    # pointing at a sensitive directory (e.g. ~/.ssh) is caught before any
+    # per-entry symlink resolution in resolve_config_symlinks.
+    _check_dir_safe "${OC_CONFIG_DIR}" "XDG_CONFIG_HOME (opencode config)"
     _check_dir_safe "${OC_DATA_DIR}"   "XDG_DATA_HOME (opencode data)"
     _check_dir_safe "${OC_CACHE_DIR}"  "XDG_CACHE_HOME (opencode cache)"
 }
@@ -338,7 +342,7 @@ build_opencode_config_mount() {
 # behaviour for shared accounts.  On a personal account, run with
 # --init-auth once to create the file and bootstrap persistent auth.
 #
-# Any files NOT in the persist list (e.g. mcp-auth.json, plans/)
+# Any files NOT in the persist list (e.g. mcp-auth.json)
 # will be writable inside the sandbox but discarded on exit.
 build_opencode_data_mounts() {
     BWRAP_ARGS+=(

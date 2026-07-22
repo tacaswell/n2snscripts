@@ -259,7 +259,6 @@ ensure_host_dirs() {
         "${CLAUDE_HOME_DIR}/todos" \
         "${CLAUDE_HOME_DIR}/statsig" \
         "${CLAUDE_HOME_DIR}/file-history" \
-        "${CLAUDE_HOME_DIR}/plans" \
         "${CLAUDE_HOME_DIR}/sessions"
     touch "${CLAUDE_HOME_DIR}/history.jsonl" \
           "${CLAUDE_HOME_DIR}/.last-cleanup"
