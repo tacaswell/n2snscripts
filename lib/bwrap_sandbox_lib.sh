@@ -367,7 +367,7 @@ parse_all_git_includes() {
     fi
 }
 
-# ── Env var passthrough helper ───────────────────────────────────
+# ── Env var passthrough helpers ──────────────────────────────────
 
 pass_through_if_set() {
     local var_name="$1"
@@ -375,6 +375,28 @@ pass_through_if_set() {
     if [[ -n "${var_val}" ]]; then
         BWRAP_ARGS+=(--setenv "${var_name}" "${var_val}")
     fi
+}
+
+# forward_env_by_prefix PREFIX
+#   Iterate over all exported environment variables whose names start with
+#   PREFIX and append a --setenv entry to BWRAP_ARGS for each one found.
+#   Uses the safe `while IFS= read -r` form so variable names containing
+#   unusual characters (e.g. BASH_FUNC_module%%) are handled correctly.
+#
+#   Values are passed through as-is; print_dry_run redacts any names that
+#   match the sensitive patterns in _is_secret_env_var.
+#
+#   Example:
+#     forward_env_by_prefix GH_TOKEN_    # forwards GH_TOKEN_NSLS2, GH_TOKEN_PERSONAL, …
+#     forward_env_by_prefix COPILOT_PROVIDER_
+forward_env_by_prefix() {
+    local _prefix="$1"
+    local _key
+    while IFS= read -r _key; do
+        if [[ "${_key}" == "${_prefix}"* ]]; then
+            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
+        fi
+    done < <(compgen -e)
 }
 
 # ── Path safety validation ───────────────────────────────────────

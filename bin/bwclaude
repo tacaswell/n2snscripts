@@ -394,22 +394,13 @@ build_claude_env() {
     fi
 
     # Forward any host CLAUDE_* env vars (incl. user overrides for verbosity, etc.).
-    local _key
-    while IFS= read -r _key; do
-        if [[ "${_key}" == CLAUDE_* ]]; then
-            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
-        fi
-    done < <(compgen -e)
+    forward_env_by_prefix CLAUDE_
 
     # GitHub CLI token passthrough (opt-in via --github-tokens).
     # Values are passed through as-is; print_dry_run redacts them centrally
     # for all secrets matching sensitive name patterns.
     if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
-        while IFS= read -r _key; do
-            if [[ "${_key}" == GH_TOKEN_* ]]; then
-                BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
-            fi
-        done < <(compgen -e)
+        forward_env_by_prefix GH_TOKEN_
     fi
 
     # Enforce after the loop so host env cannot override these.

@@ -429,12 +429,7 @@ build_codex_env() {
     # Generic CODEX_* sweep — covers CODEX_HOME, CODEX_SQLITE_HOME,
     # CODEX_API_KEY, CODEX_ACCESS_TOKEN, CODEX_CA_CERTIFICATE, and any
     # user-defined CODEX_* overrides in a single pass.
-    local _key
-    while IFS= read -r _key; do
-        if [[ "${_key}" == CODEX_* ]]; then
-            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
-        fi
-    done < <(compgen -e)
+    forward_env_by_prefix CODEX_
 
     # --debug wrapper flag: force verbose logging regardless of host env.
     if [[ "${DEBUG_MODE}" -eq 1 ]]; then
@@ -445,11 +440,7 @@ build_codex_env() {
     # Values are passed through as-is; print_dry_run redacts them centrally
     # for all secrets matching sensitive name patterns.
     if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
-        while IFS= read -r _key; do
-            if [[ "${_key}" == GH_TOKEN_* ]]; then
-                BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
-            fi
-        done < <(compgen -e)
+        forward_env_by_prefix GH_TOKEN_
     fi
 }
 

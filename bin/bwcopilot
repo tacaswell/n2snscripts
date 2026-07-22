@@ -377,24 +377,13 @@ build_copilot_env() {
     pass_through_if_set COPILOT_MODEL
 
     # Pass through any COPILOT_PROVIDER_* env vars.
-    # Use safe while-read form (consistent with the GH_TOKEN_* block below)
-    # to avoid word-splitting on unusual env-var names.
-    local _key
-    while IFS= read -r _key; do
-        if [[ "${_key}" == COPILOT_PROVIDER_* ]]; then
-            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
-        fi
-    done < <(compgen -e)
+    forward_env_by_prefix COPILOT_PROVIDER_
 
     # GitHub CLI token passthrough (opt-in via --github-tokens).
     # Values are passed through as-is; print_dry_run redacts them centrally
     # for all secrets matching sensitive name patterns.
     if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
-        while IFS= read -r _key; do
-            if [[ "${_key}" == GH_TOKEN_* ]]; then
-                BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
-            fi
-        done < <(compgen -e)
+        forward_env_by_prefix GH_TOKEN_
     fi
 }
 
