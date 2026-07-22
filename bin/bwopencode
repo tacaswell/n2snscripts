@@ -165,7 +165,7 @@ Wrapper options (consumed before opencode sees the command line):
                   Use this to run scripts, diagnostic tools, or any command with
                   the same filesystem isolation and environment as opencode itself.
                   Example: bwopencode --exec bash
-                           bwopencode --exec 'env | sort'
+                           bwopencode --exec 'bash -c "env | sort"'
   --init-auth     Create auth.json on the host so GitHub OAuth tokens persist
                   across sessions.  Run once on a personal account; skip on
                   shared accounts (tokens will be ephemeral by default).
@@ -196,7 +196,10 @@ HELP_EOF
     # Delegate to opencode --help inside the sandbox so the user sees the full
     # opencode option set in the same invocation.  We re-exec this script with
     # --exec so the sandbox is fully constructed; opencode --help is passed
-    # as the sandbox command.
+    # as the sandbox command.  Resolve the binary here (not in main) so that
+    # --help works even when opencode is not installed — the wrapper text is
+    # shown first and the error only occurs if the user expects tool help too.
+    resolve_tool_binary
     exec "$0" --exec "${_TOOL_BIN} --help"
 }
 
@@ -415,13 +418,13 @@ build_opencode_env() {
 
 main() {
     parse_wrapper_args "$@"
-    resolve_tool_binary
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
         # show_help does exec, never returns
     fi
 
+    resolve_tool_binary
     detect_bwrap_capabilities
     detect_kernel_capabilities
     resolve_common_paths

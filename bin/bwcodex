@@ -207,7 +207,7 @@ Wrapper options (consumed before codex sees the command line):
                   Use this to run scripts, diagnostic tools, or any command with
                   the same filesystem isolation and environment as codex itself.
                   Example: bwcodex --exec bash
-                           bwcodex --exec 'env | sort'
+                           bwcodex --exec 'bash -c "env | sort"'
   --init-auth     Create ~/.codex/auth.json on the host so that ChatGPT-login
                   OAuth tokens persist across sessions.  Only meaningful for the
                   BNL ITD ChatGPT subscription auth path; has no effect for
@@ -256,7 +256,10 @@ Authentication:
 
 HELP_EOF
     # Delegate to codex --help inside the sandbox so the user sees the full
-    # codex option set in the same invocation.
+    # codex option set in the same invocation.  Resolve the binary here so
+    # that --help works even when codex is not installed — the wrapper text
+    # is shown first and the error only occurs if the tool is also needed.
+    resolve_tool_binary
     exec "$0" --exec "${_TOOL_BIN} --help"
 }
 
@@ -464,13 +467,13 @@ build_codex_bin_mount() {
 
 main() {
     parse_wrapper_args "$@"
-    resolve_tool_binary
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
         # show_help does exec, never returns
     fi
 
+    resolve_tool_binary
     detect_bwrap_capabilities
     detect_kernel_capabilities
     resolve_common_paths

@@ -172,7 +172,7 @@ Wrapper options (consumed before copilot sees the command line):
                   Use this to run scripts, diagnostic tools, or any command with
                   the same filesystem isolation and environment as copilot itself.
                   Example: bwcopilot --exec bash
-                           bwcopilot --exec 'env | sort'
+                           bwcopilot --exec 'bash -c "env | sort"'
   --init-auth     Persist auth tokens to host (run once on personal machines).
   --new-session   Force bwrap to call setsid(2), detaching the sandbox from the
                   controlling terminal.  This is the default on older kernels
@@ -214,7 +214,10 @@ Known limitation:
 
 HELP_EOF
     # Delegate to copilot --help inside the sandbox so the user sees the full
-    # copilot option set in the same invocation.
+    # copilot option set in the same invocation.  Resolve the binary here so
+    # that --help works even when copilot is not installed — the wrapper text
+    # is shown first and the error only occurs if the tool is also needed.
+    resolve_tool_binary
     exec "$0" --exec "${_TOOL_BIN} --help"
 }
 
@@ -401,13 +404,13 @@ build_copilot_env() {
 
 main() {
     parse_wrapper_args "$@"
-    resolve_tool_binary
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
         # show_help does exec, never returns
     fi
 
+    resolve_tool_binary
     detect_bwrap_capabilities
     detect_kernel_capabilities
     resolve_common_paths

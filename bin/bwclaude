@@ -179,7 +179,7 @@ Wrapper options (consumed before claude sees the command line):
                   Use this to run scripts, diagnostic tools, or any command with
                   the same filesystem isolation and environment as claude itself.
                   Example: bwclaude --exec bash
-                           bwclaude --exec 'env | sort'
+                           bwclaude --exec 'bash -c "env | sort"'
   --init-auth     Persist auth credentials to host (run once on personal machines).
   --debug         Enable verbose debug logging (sets ANTHROPIC_LOG=debug,
                   NODE_DEBUG=http,https,tls, and passes --debug --verbose to claude).
@@ -218,7 +218,10 @@ Authentication:
 
 HELP_EOF
     # Delegate to claude --help inside the sandbox so the user sees the full
-    # claude option set in the same invocation.
+    # claude option set in the same invocation.  Resolve the binary here so
+    # that --help works even when claude is not installed — the wrapper text
+    # is shown first and the error only occurs if the tool is also needed.
+    resolve_tool_binary
     exec "$0" --exec "${_TOOL_BIN} --help"
 }
 
@@ -452,13 +455,13 @@ build_claude_bin_mount() {
 
 main() {
     parse_wrapper_args "$@"
-    resolve_tool_binary
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
         # show_help does exec, never returns
     fi
 
+    resolve_tool_binary
     detect_bwrap_capabilities
     detect_kernel_capabilities
     resolve_common_paths
