@@ -83,6 +83,7 @@ source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 
 INIT_AUTH=0
 DEBUG_MODE=0
+FORWARD_GH_TOKENS=0
 
 # ═══════════════════════════════════════════════════════════════════
 # Tool-specific functions
@@ -113,6 +114,10 @@ parse_wrapper_args() {
                 ;;
             --debug)
                 DEBUG_MODE=1
+                shift
+                ;;
+            --github-tokens)
+                FORWARD_GH_TOKENS=1
                 shift
                 ;;
             --new-session)
@@ -197,6 +202,11 @@ Wrapper options (consumed before claude sees the command line):
                   Symlinks are resolved before the safety check is applied.
   --rw-path PATH  Mount PATH (file or directory) read-write into the sandbox.
                   Same blocked-path rules as --ro-path.  May be repeated.
+  --github-tokens Forward any GH_TOKEN_* environment variables into the
+                  sandbox so the agent can authenticate the gh(1) CLI.
+                  Off by default.  When set, use per-command token selection:
+                    GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo
+                    GH_TOKEN="$GH_TOKEN_PERSONAL" gh issue list -R user/repo
 
 All other arguments are passed through to claude unchanged.
 
@@ -381,6 +391,23 @@ build_claude_env() {
             BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
         fi
     done < <(compgen -e)
+
+    # GitHub CLI token passthrough (opt-in via --github-tokens)
+    # In --dry-run mode the value is replaced with REDACTED so that tokens
+    # are not printed to the terminal in the bwrap command output.
+    if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
+        local _gh_val
+        while IFS= read -r _key; do
+            if [[ "${_key}" == GH_TOKEN_* ]]; then
+                if [[ "${DRY_RUN}" -eq 1 ]]; then
+                    _gh_val="REDACTED"
+                else
+                    _gh_val="${!_key}"
+                fi
+                BWRAP_ARGS+=(--setenv "${_key}" "${_gh_val}")
+            fi
+        done < <(compgen -e)
+    fi
 
     # Enforce after the loop so host env cannot override these.
     BWRAP_ARGS+=(--setenv CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS 1)
