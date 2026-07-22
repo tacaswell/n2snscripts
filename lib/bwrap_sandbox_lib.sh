@@ -1247,6 +1247,29 @@ _bwrap_flag_arity() {
     esac
 }
 
+# _is_secret_env_var NAME
+#   Return 0 (true) if the environment variable NAME is considered sensitive
+#   and its value should be redacted in --dry-run output.  Covers API keys,
+#   tokens, and credentials forwarded by the bw* wrappers.
+_is_secret_env_var() {
+    case "$1" in
+        # Generic suffix patterns
+        *_API_KEY | *_ACCESS_TOKEN | *_SECRET | *_PASSWORD | *_TOKEN)
+            return 0 ;;
+        # GitHub tokens (bare and prefixed)
+        GH_TOKEN | GITHUB_TOKEN | GH_TOKEN_*)
+            return 0 ;;
+        # Anthropic / AIFAPIM foundry
+        ANTHROPIC_FOUNDRY_API_KEY | AIFAPIM_API_KEY)
+            return 0 ;;
+        # OpenAI / Codex (also caught by *_API_KEY/*_ACCESS_TOKEN above,
+        # listed explicitly for clarity)
+        OPENAI_API_KEY | CODEX_API_KEY | CODEX_ACCESS_TOKEN)
+            return 0 ;;
+    esac
+    return 1
+}
+
 print_dry_run() {
     local _BWRAP_BIN _ENV_BIN
     _BWRAP_BIN="$(command -v bwrap)"
@@ -1266,16 +1289,39 @@ print_dry_run() {
     # Print bwrap arguments one flag-plus-values per line.  Each flag's
     # value count comes from _bwrap_flag_arity, so a value beginning with
     # "--" is grouped with its flag instead of being misread as a new flag.
-    local i=0 arg _arity _j
+    #
+    # For --setenv NAME VALUE pairs where NAME matches a sensitive pattern
+    # (_is_secret_env_var), VALUE is replaced with REDACTED so secrets are
+    # not echoed to the terminal.  The actual launch_sandbox path always
+    # passes the real values.
+    local i=0 arg _arity _j _varname
     while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
         arg="${BWRAP_ARGS[$i]}"
         _arity="$(_bwrap_flag_arity "${arg}")"
         printf "    %s" "${arg}"
         i=$((i + 1))
-        for ((_j = 0; _j < _arity && i < ${#BWRAP_ARGS[@]}; _j++)); do
-            printf " '%s'" "${BWRAP_ARGS[$i]}"
-            i=$((i + 1))
-        done
+        if [[ "${arg}" == "--setenv" && "${_arity}" -eq 2 ]]; then
+            # First value is the variable name — always print it.
+            if [[ $i -lt ${#BWRAP_ARGS[@]} ]]; then
+                _varname="${BWRAP_ARGS[$i]}"
+                printf " '%s'" "${_varname}"
+                i=$((i + 1))
+            fi
+            # Second value is the variable value — redact if sensitive.
+            if [[ $i -lt ${#BWRAP_ARGS[@]} ]]; then
+                if _is_secret_env_var "${_varname}"; then
+                    printf " 'REDACTED'"
+                else
+                    printf " '%s'" "${BWRAP_ARGS[$i]}"
+                fi
+                i=$((i + 1))
+            fi
+        else
+            for ((_j = 0; _j < _arity && i < ${#BWRAP_ARGS[@]}; _j++)); do
+                printf " '%s'" "${BWRAP_ARGS[$i]}"
+                i=$((i + 1))
+            done
+        fi
         printf " \\\\\n"
     done
     printf "    --"
