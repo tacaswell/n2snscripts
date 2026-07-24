@@ -198,23 +198,82 @@ detect_shell() {
     SANDBOX_SHELL="$(command -v bash 2> /dev/null || echo /bin/sh)"
 }
 
+# _expand_leading_tilde VALUE
+#   Expand only a *leading* tilde in VALUE and echo the result:
+#     "~"        -> $HOME
+#     "~/path"   -> $HOME/path
+#     "~user"    -> that user's home directory (resolved via getent passwd)
+#     "~user/p"  -> that user's home directory + /p
+#     (no leading ~) -> VALUE unchanged
+#   Returns 0 on success; returns 1 (echoing nothing) if a ~user reference
+#   cannot be resolved.  A blind ${VALUE/#\~/${_HOME}} substitution is WRONG:
+#   it turns "~alice/foo" into "${HOME}alice/foo", silently corrupting the path.
+_expand_leading_tilde() {
+    local value="$1"
+    # The "~" / "~/" case patterns match a *literal* leading tilde in the input;
+    # we are not asking the shell to expand a tilde here (SC2088 false positive).
+    # shellcheck disable=SC2088
+    case "${value}" in
+        "~")
+            printf '%s' "${_HOME}"
+            ;;
+        "~/"*)
+            printf '%s' "${_HOME}/${value#\~/}"
+            ;;
+        "~"*)
+            # ~user or ~user/subpath — resolve the named user's home dir.
+            local _rest="${value#\~}"           # "user" or "user/subpath"
+            local _user="${_rest%%/*}"          # "user"
+            local _subpath=""
+            [[ "${_rest}" == */* ]] && _subpath="/${_rest#*/}"
+            local _uhome
+            _uhome="$(getent passwd "${_user}" 2> /dev/null | cut -d: -f6)"
+            [[ -n "${_uhome}" ]] || return 1
+            printf '%s' "${_uhome}${_subpath}"
+            ;;
+        *)
+            printf '%s' "${value}"
+            ;;
+    esac
+    return 0
+}
+
 # ── Dynamic mount helpers ────────────────────────────────────────
 # _MOUNTED_PREFIXES: tracks directory trees already covered by a bwrap
 # bind so we never emit duplicate (or redundant sub-path) mounts.
 # Keys are canonical paths; value is always 1.
 # Pre-populated with unconditional mounts in build_dynamic_tool_mounts.
 
-# _get_npm_prefix
-#   Echo the npm global prefix (`npm prefix -g`), caching the result so the
-#   subprocess is forked at most once per run even when several symlinked
-#   tools are resolved.  Echoes the empty string if npm is not installed or
-#   the lookup fails.
-_get_npm_prefix() {
-    if [[ "${_NPM_PREFIX_RESOLVED}" -eq 0 ]]; then
+# _resolve_npm_prefix
+#   Populate the _NPM_PREFIX / _NPM_PREFIX_RESOLVED globals with the npm global
+#   prefix (`npm prefix -g`), forking node at most once per run.  _NPM_PREFIX is
+#   the empty string if npm is absent or the lookup fails.
+#
+#   IMPORTANT: this MUST be called in a non-subshell context (not inside a
+#   $(...) command substitution) so the globals it sets persist.  The previous
+#   design echoed the value and was always called via $(...), so the "resolved"
+#   flag was set in a subshell and lost — forking node on *every* lookup, and
+#   creating ~/.npm/_logs on the host even under --dry-run.  Callers now invoke
+#   this directly and then read ${_NPM_PREFIX}.
+#
+#   `npm prefix -g` writes a logfile under $npm_config_cache/_logs (default
+#   ~/.npm/_logs).  To keep --dry-run (and every run) free of that host-state
+#   mutation, the cache is pointed at a throwaway temp dir that is removed
+#   immediately after the call.
+_resolve_npm_prefix() {
+    [[ "${_NPM_PREFIX_RESOLVED}" -eq 1 ]] && return 0
+    _NPM_PREFIX_RESOLVED=1
+    _NPM_PREFIX=""
+    command -v npm > /dev/null 2>&1 || return 0
+
+    local _npm_tmp
+    _npm_tmp="$(mktemp -d 2> /dev/null || true)"
+    if [[ -n "${_npm_tmp}" ]]; then
+        _NPM_PREFIX="$(npm_config_cache="${_npm_tmp}" npm prefix -g 2> /dev/null || true)"
+        rm -rf "${_npm_tmp}"
+    else
         _NPM_PREFIX="$(npm prefix -g 2> /dev/null || true)"
-        _NPM_PREFIX_RESOLVED=1
     fi
-    printf '%s' "${_NPM_PREFIX}"
 }
 
 # _emit_home_intermediate_dirs DIR [MODE]
@@ -319,9 +378,14 @@ resolve_and_mount_tool() {
 
     if [[ -L "${bin_path}" ]]; then
         real_path="$(readlink -f "${bin_path}")"
-        npm_prefix="$(_get_npm_prefix)"
+        _resolve_npm_prefix
+        npm_prefix="${_NPM_PREFIX}"
         if [[ -n "${npm_prefix}" ]] && [[ "${real_path}" == "${npm_prefix}"/* ]]; then
             # npm-installed: mount the whole prefix so lib/node_modules is reachable.
+            # Also mount the on-PATH directory the symlink lives in: it may be an
+            # otherwise-unmounted dir (e.g. ~/.local/bin/claude -> npm prefix), and
+            # without it the symlink source path is absent inside the sandbox.
+            _mount_ro_dir_if_needed "${cmd_dir}"
             _mount_npm_global_prefix "${npm_prefix}"
             return 0
         fi
@@ -344,7 +408,8 @@ resolve_and_mount_tool() {
 _mount_npm_global_prefix() {
     local npm_prefix="${1:-}"
     if [[ -z "${npm_prefix}" ]]; then
-        npm_prefix="$(_get_npm_prefix)"
+        _resolve_npm_prefix
+        npm_prefix="${_NPM_PREFIX}"
     fi
     [[ -n "${npm_prefix}" ]] && [[ -d "${npm_prefix}" ]] || return 0
 
@@ -368,19 +433,55 @@ parse_git_includes() {
     # the config file (the symlink path, NOT the resolved target).
     local config_dir="${config_file%/*}"
 
-    # Extract path values from [include] and [includeIf "..."] sections.
-    # Matches lines like:  path = /some/path  or  path = ~/relative
-    # Pure bash — no grep/sed/xargs subprocesses.
+    # Extract include path values.  Pure bash — no grep/sed/xargs subprocesses.
+    #
+    # A `path = ...` key is only an include directive when it sits inside an
+    # [include] section.  Git's parser is section-scoped; without tracking the
+    # current section, a `path =` key in an unrelated section such as
+    # [difftool "x"] or [delta] is mis-read as an include, which would mount an
+    # arbitrary path — or hard-exit build_git_mounts if that path lands in a
+    # blocked prefix (e.g. a legal difftool.path).
+    #
+    # LIMITATION: [includeIf "<cond>"] conditional includes are intentionally
+    # NOT honored.  Correctly evaluating gitdir/onbranch/hasconfig conditions
+    # with git's glob semantics is out of scope for this pure-bash parser, and
+    # the target repository is not even known at this point (build_workdir_mount
+    # runs later).  Rather than over-mount an include whose condition may not
+    # apply — which could also trip the blocked-path guard on otherwise-legal
+    # config — conditional includes are skipped.  Git silently ignores a missing
+    # include, so the tool still runs; only the conditionally-included settings
+    # are absent inside the sandbox.
+    local line _section _section_name path_val
+    local in_include=0
     while IFS= read -r line || [[ -n "${line}" ]]; do
+        # Section header, e.g. "[include]", "  [includeIf \"gitdir:~/w/\"]",
+        # "[difftool \"meld\"]".  Update the current-section flag and move on.
+        if [[ "${line}" =~ ^[[:space:]]*\[([^]]+)\] ]]; then
+            _section="${BASH_REMATCH[1]}"
+            # Strip any trailing subsection (quoted part) and lowercase — git
+            # section names are case-insensitive.
+            _section_name="${_section%%[[:space:]]*}"
+            _section_name="${_section_name,,}"
+            if [[ "${_section_name}" == "include" ]]; then
+                in_include=1
+            else
+                in_include=0
+            fi
+            continue
+        fi
+
+        # Only honor `path =` inside an [include] section.
+        [[ "${in_include}" -eq 1 ]] || continue
         [[ "${line}" =~ ^[[:space:]]*path[[:space:]]*=[[:space:]]*(.*) ]] || continue
-        local path_val="${BASH_REMATCH[1]}"
+        path_val="${BASH_REMATCH[1]}"
 
         # Trim trailing whitespace
         path_val="${path_val%"${path_val##*[![:space:]]}"}"
         [[ -z "${path_val}" ]] && continue
 
-        # Resolve ~/ prefix
-        path_val="${path_val/#\~/${_HOME}}"
+        # Expand a leading ~/ (or ~user/).  Skip the include if a ~user
+        # reference cannot be resolved rather than silently corrupting it.
+        path_val="$(_expand_leading_tilde "${path_val}")" || continue
 
         # Resolve relative paths (relative to the config file's directory)
         if [[ "${path_val}" != /* ]]; then
@@ -793,8 +894,13 @@ validate_extra_path() {
     local raw_path="$1"
     local mode="$2"
 
-    # Expand a leading ~/ to $HOME (readlink -f won't do this for us).
-    local expanded_path="${raw_path/#\~/${_HOME}}"
+    # Expand a leading ~/ or ~user/ to a real path (readlink -f won't do this
+    # for us).  Reject an unresolvable ~user rather than corrupting the path.
+    local expanded_path
+    if ! expanded_path="$(_expand_leading_tilde "${raw_path}")"; then
+        echo "Error: --${mode}-path '${raw_path}': cannot resolve '~user' home directory." >&2
+        exit 1
+    fi
 
     # Resolve to canonical path (follows symlinks, removes . and ..).
     local canon
@@ -833,11 +939,44 @@ validate_extra_path() {
 #   $HOME tmpfs that intermediate --dir entries populate).
 build_extra_path_mounts() {
     local _raw_path _canon _target
+    local -a _ro_canon=() _rw_canon=()
+
+    # Validate everything up front (canonicalizing each path) so RO/RW nesting
+    # can be cross-checked before any mount is emitted.  The explicit `|| exit`
+    # matters because validate_extra_path runs in a command substitution here:
+    # its own `exit 1` only terminates the subshell, so we must propagate it
+    # rather than let the loop continue with an empty canonical path.
+    for _raw_path in "${EXTRA_RO_PATHS[@]+"${EXTRA_RO_PATHS[@]}"}"; do
+        _canon="$(validate_extra_path "${_raw_path}" "ro")" || exit 1
+        _ro_canon+=("${_canon}")
+    done
+    for _raw_path in "${EXTRA_RW_PATHS[@]+"${EXTRA_RW_PATHS[@]}"}"; do
+        _canon="$(validate_extra_path "${_raw_path}" "rw")" || exit 1
+        _rw_canon+=("${_canon}")
+    done
+
+    # ── RO-under-RW nesting guard ────────────────────────────────
+    # bwrap applies binds in order, and this function emits every --ro-bind
+    # before every --bind.  An explicit --ro-path that is the same as, or
+    # nested under, a --rw-path would therefore be silently re-covered by the
+    # later parent --bind and become WRITABLE.  Fail closed instead of granting
+    # unintended write access.  (The reverse — a --rw-path nested under a
+    # --ro-path — is the legitimate "read-only tree with one writable subdir"
+    # pattern and is allowed: the child --bind correctly overrides the parent.)
+    local _ro _rw
+    for _ro in "${_ro_canon[@]+"${_ro_canon[@]}"}"; do
+        for _rw in "${_rw_canon[@]+"${_rw_canon[@]}"}"; do
+            if _is_prefix_of "${_rw}" "${_ro}"; then
+                echo "Error: --ro-path '${_ro}' is the same as or nested under --rw-path '${_rw}'." >&2
+                echo "       The read-write mount would override it and expose it writable." >&2
+                echo "       Refusing to mount — narrow the --rw-path or drop the --ro-path." >&2
+                exit 1
+            fi
+        done
+    done
 
     # ── Read-only extra paths ────────────────────────────────────
-    for _raw_path in "${EXTRA_RO_PATHS[@]+"${EXTRA_RO_PATHS[@]}"}"; do
-        _canon="$(validate_extra_path "${_raw_path}" "ro")"
-
+    for _canon in "${_ro_canon[@]+"${_ro_canon[@]}"}"; do
         if [[ -d "${_canon}" ]]; then
             # Directories: go through the dedup helper.
             _mount_ro_dir_if_needed "${_canon}"
@@ -851,9 +990,7 @@ build_extra_path_mounts() {
     done
 
     # ── Read-write extra paths ───────────────────────────────────
-    for _raw_path in "${EXTRA_RW_PATHS[@]+"${EXTRA_RW_PATHS[@]}"}"; do
-        _canon="$(validate_extra_path "${_raw_path}" "rw")"
-
+    for _canon in "${_rw_canon[@]+"${_rw_canon[@]}"}"; do
         # Pre-create the intermediate --dir chain when the path is under
         # $HOME.  For a directory the chain includes the target itself (the
         # subsequent --bind lands on top of that --dir); for a file the
@@ -866,6 +1003,11 @@ build_extra_path_mounts() {
         _emit_home_intermediate_dirs "${_target}" inclusive
 
         BWRAP_ARGS+=(--bind "${_canon}" "${_canon}")
+
+        # Register RW directory trees so any later mount attempt is
+        # de-duplicated against them (RO paths were emitted above; only RW
+        # dirs were previously left unregistered in _MOUNTED_PREFIXES).
+        [[ -d "${_canon}" ]] && _MOUNTED_PREFIXES["${_canon}"]=1
     done
 }
 
