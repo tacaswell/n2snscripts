@@ -25,11 +25,14 @@ Every `bw*` wrapper accepts these options:
 
 | Option | Effect |
 | --- | --- |
-| `--help`, `-h` | Show wrapper help plus the underlying tool's help |
+| `--help`, `-h` | Show wrapper help and exit (does not run the underlying tool or require credentials). For the tool's own help, use `--exec <tool> --help` |
 | `--dry-run` | Print the `bwrap` command without executing it |
 | `--exec CMD` | Run `CMD` inside the sandbox instead of the tool |
 | `--init-auth` | Persist auth credentials to the host (first-time setup) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
+| `--ro-path PATH` | Mount `PATH` (file or directory) read-only into the sandbox. May be repeated. Dangerous paths are blocked (see wrapper help for full list) |
+| `--rw-path PATH` | Mount `PATH` (file or directory) read-write into the sandbox. May be repeated. Same blocked-path rules as `--ro-path` |
+| `--github-tokens` | Forward any `GH_TOKEN_*` environment variables into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 Tool-specific options are listed in each wrapper's section below.
 
@@ -41,14 +44,10 @@ Launches [opencode](https://opencode.ai) inside a bubblewrap sandbox.
 bwopencode [bwopencode-options] [opencode arguments...]
 ```
 
-Persists database, logs, snapshots, storage, tool-output, and
+Persists database, logs, plans, snapshots, storage, tool-output, and
 project-dotfiles to the host data dir; `auth.json` is persisted only if
 it already exists on the host (use `--init-auth` once to create it for
 personal accounts).
-
-| Option | Description |
-| --- | --- |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 ## `bwclaude`
 
@@ -80,7 +79,6 @@ Additional options:
 | Option | Effect |
 | --- | --- |
 | `--debug` | Enable verbose debug logging: sets `ANTHROPIC_LOG=debug`, `NODE_DEBUG=http,https,tls`, and passes `--debug --verbose` to `claude` |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 On shared accounts, auth is ephemeral. On a personal machine, run
 `bwclaude --init-auth` once to persist credentials.
@@ -93,12 +91,6 @@ inside a bubblewrap sandbox.
 ```text
 bwcopilot [bwcopilot-options] [copilot arguments...]
 ```
-
-Additional options:
-
-| Option | Effect |
-| --- | --- |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 On shared accounts, auth tokens are ephemeral. On a personal machine,
 run `bwcopilot --init-auth` once to persist tokens.
@@ -127,7 +119,6 @@ Additional options:
 | --- | --- |
 | `--debug` | Enable verbose Codex logging (sets `RUST_LOG=debug`) |
 | `--persist-config` | Bind-mount `~/.codex/config.toml` read-write into the sandbox so changes (e.g. project-trust grants) persist across sessions. Without this flag, `config.toml` is staged read-write into a per-session copy that is discarded on exit. Concurrent `--persist-config` sessions may race on writes |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 Note: Codex CLI also enforces its own inner Landlock-based sandbox for
 agent tool calls. The outer `bwrap` here is complementary — it scopes
