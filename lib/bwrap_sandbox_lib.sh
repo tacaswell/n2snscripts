@@ -381,12 +381,24 @@ resolve_and_mount_tool() {
     local bin_path="$1"
     [[ -n "${bin_path}" ]] || return 0
 
-    local cmd_dir real_path npm_prefix
+    local cmd_dir real_path npm_prefix cmd_dir_canon
     cmd_dir="$(dirname "${bin_path}")"
 
-    # Record for SANDBOX_PATH even if the mount is skipped (dir already
-    # covered): the path still needs to be on PATH inside the sandbox.
+    # Record the on-PATH dir for SANDBOX_PATH so the tool remains reachable via
+    # the same name inside the sandbox.  The tool is invoked by its LOGICAL path
+    # (_TOOL_BIN = `command -v NAME`), and it is mounted below at that same
+    # logical path, so PATH must carry the logical dir too.
     _EXTRA_PATH_DIRS+=("${cmd_dir}")
+
+    # Path-safety must be judged on the canonical target, not the logical path:
+    # a symlinked on-PATH directory whose target is a blocked subtree (e.g.
+    # ~/bin -> ~/.ssh) would otherwise slip a blocked tree past _check_path_safe.
+    # We validate the canonical target here, but still MOUNT the logical cmd_dir
+    # below so the tool stays reachable at the path the sandbox invokes it by
+    # (mounting the canonical dir instead would leave _TOOL_BIN's logical path
+    # absent in the tmpfs $HOME).  _check_path_safe dies on a blocked path.
+    cmd_dir_canon="$(readlink -f "${cmd_dir}" 2> /dev/null || printf '%s' "${cmd_dir}")"
+    _check_path_safe "${cmd_dir_canon}" "tool directory"
 
     if [[ -L "${bin_path}" ]]; then
         real_path="$(readlink -f "${bin_path}")"
@@ -402,6 +414,8 @@ resolve_and_mount_tool() {
             return 0
         fi
         _mount_ro_dir_if_needed "${cmd_dir}"
+        # dirname of the real_path is already canonical (real_path came from
+        # readlink -f), so no additional canonicalization needed here.
         _mount_ro_dir_if_needed "$(dirname "${real_path}")"
     else
         # Non-symlink binary: mount its directory.  _mount_ro_dir_if_needed
@@ -489,6 +503,56 @@ parse_git_includes() {
 
         # Trim trailing whitespace
         path_val="${path_val%"${path_val##*[![:space:]]}"}"
+        [[ -z "${path_val}" ]] && continue
+
+        # Strip inline comments and surrounding double-quotes.  Git treats `#`
+        # and `;` as comment starts (the rest of the line is ignored) UNLESS the
+        # character is inside a quoted string.  Git also strips surrounding
+        # double-quotes and interprets backslash escapes (`\"` and `\\`) inside
+        # those quotes.
+        #
+        # Minimal implementation: handle the two most common cases:
+        #   1. Whole-value double-quoted:  path = "/real/path"
+        #   2. Unquoted trailing comment:  path = /real/path ; note
+        #
+        # LIMITATION: mixed quotes/comments (e.g. path = "/path with ; semicolon")
+        # are not fully parsed — the `;` inside the quoted string would still
+        # trigger comment stripping here, which is WRONG per git's rules.  Full
+        # git-compatible quote/escape parsing is out of scope for this pure-bash
+        # parser.  The existing -e check fails closed: an incorrectly-stripped
+        # path fails the existence test and the include is silently dropped (no
+        # over-mount), so the tool runs but without that include's settings.
+        #
+        # Strip surrounding double-quotes if present (whole-value quoted case).
+        # The pattern [[ "${path_val}" == \"*\" ]] matches a value that both
+        # starts and ends with a literal double-quote.
+        if [[ "${path_val}" == \"*\" ]]; then
+            # Strip leading and trailing quotes.
+            path_val="${path_val#\"}"
+            path_val="${path_val%\"}"
+            # Handle git's backslash escapes minimally: \\ -> \, \" -> ".
+            # (Full git escape parsing also covers \n, \t, \b, but paths do not
+            # typically use those; we handle only the two that appear in practice.)
+            path_val="${path_val//\\\\/\\}"
+            path_val="${path_val//\\\"/\"}"
+        else
+            # Unquoted: strip an inline ` #` or ` ;` comment (a space followed by
+            # the comment char — git requires the leading space).  We match
+            # " #" or " ;" and discard everything from that point onward, then
+            # trim trailing whitespace again (the comment may have had leading
+            # space).  This is safe for the common "path = /real/path ; note" case.
+            #
+            # KNOWN ISSUE: a `;` or `#` that is part of an unquoted path with no
+            # leading space (e.g. path = /path;with;semicolons) will be incorrectly
+            # treated as a comment start.  Such paths are exotic (and likely
+            # unintentional in git config); the -e check below will catch the
+            # resulting malformed path and skip the include.
+            if [[ "${path_val}" =~ ^([^#\;]*)[[:space:]][#\;] ]]; then
+                path_val="${BASH_REMATCH[1]}"
+                # Trim trailing whitespace from the captured part.
+                path_val="${path_val%"${path_val##*[![:space:]]}"}"
+            fi
+        fi
         [[ -z "${path_val}" ]] && continue
 
         # Expand a leading ~/ (or ~user/).  Skip the include if a ~user
@@ -1422,6 +1486,18 @@ build_workdir_mount() {
     BWRAP_ARGS+=(
         --bind "${_BIND_DIR}" "${_BIND_DIR}"
     )
+
+    # Register the workdir in _MOUNTED_PREFIXES so any later tool mounts that
+    # resolve from inside the repo (e.g. repo-local node_modules/.bin or
+    # .pixi/envs/*/bin on PATH) do not emit an --ro-bind on top of this RW bind.
+    # Later mounts win; an --ro-bind overlay would make that subtree read-only,
+    # causing npm install / pixi install to fail with EROFS.
+    #
+    # This function is called BEFORE build_dynamic_tool_mounts in every wrapper
+    # (verified in bin/bw{claude,codex,copilot,opencode}:main), so the dedup
+    # logic in resolve_and_mount_tool → _mount_ro_dir_if_needed will correctly
+    # skip any dir already covered by this bind.
+    _MOUNTED_PREFIXES["${_BIND_DIR}"]=1
 }
 
 # ── Git config (read-only) ──────────────────────────────────────
@@ -1750,31 +1826,38 @@ print_dry_run() {
     # (_is_secret_env_var), VALUE is replaced with REDACTED so secrets are
     # not echoed to the terminal.  The actual launch_sandbox path always
     # passes the real values.
+    #
+    # All values are %q-quoted (bash's shell-quote format) so paths containing
+    # single quotes, spaces, or other special characters produce a valid
+    # pasteable shell command.  The REDACTED placeholder for secrets is kept
+    # as a literal string (no quoting needed — it has no special characters).
     local i=0 arg _arity _j _varname
     while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
         arg="${BWRAP_ARGS[$i]}"
         _arity="$(_bwrap_flag_arity "${arg}")"
-        printf "    %s" "${arg}"
+        printf "    %q" "${arg}"
         i=$((i + 1))
         if [[ "${arg}" == "--setenv" && "${_arity}" -eq 2 ]]; then
             # First value is the variable name — always print it.
             if [[ $i -lt ${#BWRAP_ARGS[@]} ]]; then
                 _varname="${BWRAP_ARGS[$i]}"
-                printf " '%s'" "${_varname}"
+                printf " %q" "${_varname}"
                 i=$((i + 1))
             fi
             # Second value is the variable value — redact if sensitive.
             if [[ $i -lt ${#BWRAP_ARGS[@]} ]]; then
                 if _is_secret_env_var "${_varname}"; then
-                    printf " 'REDACTED'"
+                    # REDACTED is a literal placeholder with no special chars;
+                    # keep it unquoted for readability.
+                    printf " REDACTED"
                 else
-                    printf " '%s'" "${BWRAP_ARGS[$i]}"
+                    printf " %q" "${BWRAP_ARGS[$i]}"
                 fi
                 i=$((i + 1))
             fi
         else
             for ((_j = 0; _j < _arity && i < ${#BWRAP_ARGS[@]}; _j++)); do
-                printf " '%s'" "${BWRAP_ARGS[$i]}"
+                printf " %q" "${BWRAP_ARGS[$i]}"
                 i=$((i + 1))
             done
         fi
