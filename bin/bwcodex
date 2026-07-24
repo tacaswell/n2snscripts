@@ -133,10 +133,6 @@ parse_wrapper_arg_hook() {
     esac
 }
 
-parse_wrapper_args() {
-    parse_wrapper_args_common "$@"
-}
-
 # Find the absolute path to the codex binary on the host so we do
 # not depend on PATH lookup inside the sandbox.
 # Sets globals: _TOOL_BIN, _TOOL_CMD
@@ -314,7 +310,10 @@ build_codex_home_mount() {
         else
             local _config_fd _staged_config
             _staged_config="$(mktemp --tmpdir bwcodex-config.XXXXXX.toml)"
-            cp -p "${CODEX_CONFIG_FILE}" "${_staged_config}"
+            # Plain cp (not cp -p) preserves mktemp's restrictive 0600 mode.
+            # cp -p would re-apply the source config.toml's mode (typically 0644),
+            # creating a world-readable window until rm -f.
+            cp "${CODEX_CONFIG_FILE}" "${_staged_config}"
             # Open the copy as an fd then immediately unlink it.  The kernel
             # keeps the data alive via the open fd; the filename disappears
             # from /tmp so there is nothing to clean up on exit or signal.
@@ -373,7 +372,23 @@ build_codex_env() {
     fi
 
     # Non-CODEX_* vars that Codex consults.
-    pass_through_if_set SSL_CERT_FILE
+    # SSL_CERT_FILE: canonicalize, mount if safe, and forward; otherwise warn.
+    # If the path is already under /etc or /usr, an extra ro-bind is harmless.
+    if [[ -n "${SSL_CERT_FILE:-}" ]]; then
+        local _ssl_cert_canon
+        _ssl_cert_canon="$(readlink -f "${SSL_CERT_FILE}" 2>/dev/null || true)"
+        if [[ -n "${_ssl_cert_canon}" ]] && [[ -f "${_ssl_cert_canon}" ]]; then
+            # _check_path_safe exits on failure; run in subshell to catch it.
+            if ( _check_path_safe "${_ssl_cert_canon}" "SSL_CERT_FILE" ) 2>/dev/null; then
+                BWRAP_ARGS+=(--ro-bind "${_ssl_cert_canon}" "${_ssl_cert_canon}")
+                BWRAP_ARGS+=(--setenv SSL_CERT_FILE "${_ssl_cert_canon}")
+            else
+                printf 'Warning: SSL_CERT_FILE=%s points to a blocked path; not forwarding.\n' "${SSL_CERT_FILE}" >&2
+            fi
+        else
+            printf 'Warning: SSL_CERT_FILE=%s does not resolve to a readable file; not forwarding.\n' "${SSL_CERT_FILE}" >&2
+        fi
+    fi
     pass_through_if_set RUST_LOG
 
     # Generic CODEX_* sweep — covers CODEX_HOME, CODEX_SQLITE_HOME,
@@ -397,8 +412,8 @@ build_codex_env() {
 # ── Codex install dir (stub) ─────────────────────────────────────
 # Codex CLI is installed via npm at /usr/local/lib/node_modules/@openai/codex,
 # which build_dynamic_tool_mounts already covers via the npm-prefix mount.
-# This stub is kept for symmetry with bwclaude/bwopencode and as a future
-# hook for non-npm Codex installs (e.g. the standalone installer's
+# This stub is kept for symmetry with bwclaude (bwopencode has no such function)
+# and as a future hook for non-npm Codex installs (e.g. the standalone installer's
 # /opt/codex layout).
 build_codex_bin_mount() {
     :
@@ -409,11 +424,10 @@ build_codex_bin_mount() {
 # ═══════════════════════════════════════════════════════════════════
 
 main() {
-    parse_wrapper_args "$@"
+    parse_wrapper_args_common "$@"
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
-        # show_help does exec, never returns
     fi
 
     resolve_tool_binary
