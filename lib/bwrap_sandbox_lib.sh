@@ -116,6 +116,21 @@ GIT_INCLUDE_PATHS=()
 _BIND_DIR=""
 _GIT_ROOT=""
 
+# Canonical home and derived path-safety data (set by resolve_common_paths).
+# _HOME is the logical $HOME; _HOME_CANON is its readlink -f form.  On hosts
+# where home is reached through a symlink (NFS/automount) these differ, and
+# both must be consulted because candidate paths are canonicalized before the
+# safety check.  _HOME_ROOTS and _BLOCKED_PREFIXES are precomputed once (to
+# avoid per-check readlink forks) and consumed by _check_path_safe.
+_HOME=""
+_HOME_CANON=""
+_PWD=""
+# Guarded username (set by resolve_common_paths).  $USER may be unset under
+# `set -u` in cron/CI contexts, so fall back to `id -un`.
+_USER=""
+declare -a _HOME_ROOTS=()
+declare -a _BLOCKED_PREFIXES=()
+
 # ═══════════════════════════════════════════════════════════════════
 # Shared helper functions
 # ═══════════════════════════════════════════════════════════════════
@@ -217,9 +232,18 @@ _get_npm_prefix() {
 #                  file bind, or a read-write directory bind point).
 _emit_home_intermediate_dirs() {
     local dir="$1" mode="${2:-ancestors}"
-    [[ "${dir}" == "${_HOME}"/* ]] || return 0
-    local _rel="${dir#"${_HOME}"/}"
-    local _accum="${_HOME}"
+    # Home may be symlinked (NFS/automount): a canonicalized bind target can
+    # sit under _HOME_CANON rather than the logical _HOME.  Match against both.
+    local _home_base
+    if [[ "${dir}" == "${_HOME}"/* ]]; then
+        _home_base="${_HOME}"
+    elif [[ -n "${_HOME_CANON}" && "${dir}" == "${_HOME_CANON}"/* ]]; then
+        _home_base="${_HOME_CANON}"
+    else
+        return 0
+    fi
+    local _rel="${dir#"${_home_base}"/}"
+    local _accum="${_home_base}"
     local _parts _i _last
     IFS='/' read -ra _parts <<< "${_rel}"
     if [[ "${mode}" == "inclusive" ]]; then
@@ -628,51 +652,30 @@ _is_prefix_of() {
 #         /etc/sudoers.d/  sudo policy fragments
 #
 #   Does NOT check existence — the caller is responsible for that.
+#
+#   NOTE: this consults the precomputed _HOME_ROOTS and _BLOCKED_PREFIXES
+#   globals, which _build_blocked_prefixes populates from resolve_common_paths
+#   in BOTH logical and canonical form.  A canonical candidate therefore cannot
+#   slip past a blocked prefix that was expressed with the logical home.
 _check_path_safe() {
     local canon="$1"
     local context="$2"
 
     # ── Ancestor-of-home check ───────────────────────────────────
     # Reject if canon IS $HOME or is a directory that contains $HOME
-    # (i.e. /, /home, the username's parent dir, etc.).
-    # "_is_prefix_of canon _HOME" means: canon is a prefix of _HOME.
-    if _is_prefix_of "${canon}" "${_HOME}"; then
-        echo "Error: ${context} '${canon}' is \$HOME or an ancestor of \$HOME." >&2
-        echo "       Refusing to mount — this would expose the entire home tree." >&2
-        exit 1
-    fi
+    # (i.e. /, /home, the username's parent dir, etc.).  Checked against both
+    # the logical and canonical home so a symlinked home cannot be bypassed.
+    local _home_root
+    for _home_root in "${_HOME_ROOTS[@]}"; do
+        if _is_prefix_of "${canon}" "${_home_root}"; then
+            echo "Error: ${context} '${canon}' is \$HOME or an ancestor of \$HOME." >&2
+            echo "       Refusing to mount — this would expose the entire home tree." >&2
+            exit 1
+        fi
+    done
 
     # ── Sensitive-subtree checks ─────────────────────────────────
-    # XDG_DATA_HOME is set by resolve_common_paths, which is always called
-    # before any function that invokes _check_path_safe.
     local _blocked_prefix
-    local _BLOCKED_PREFIXES=(
-        # SSH / GPG / cloud keys
-        "${_HOME}/.ssh"
-        "${_HOME}/.gnupg"
-        "${_HOME}/.aws"
-        "${_HOME}/.kube"
-        "${_HOME}/.docker"
-        # Package-manager credentials
-        "${_HOME}/.netrc"
-        "${_HOME}/.pypirc"
-        "${_HOME}/.rattler"
-        "${_HOME}/.yarnrc"
-        "${_HOME}/.yarnrc.yml"
-        "${_HOME}/.yarn"
-        "${XDG_DATA_HOME}/uv/credentials"
-        # Password managers
-        "${_HOME}/.password-store"   # pass / gopass encrypted secret store
-        "${_HOME}/.config/1Password" # 1Password CLI session/config
-        "${_HOME}/.config/op"        # 1Password CLI (alternate path)
-        # GitHub CLI tokens
-        "${_HOME}/.config/gh"
-        # System
-        "/root"
-        "/etc/shadow"
-        "/etc/sudoers"
-        "/etc/sudoers.d"
-    )
     for _blocked_prefix in "${_BLOCKED_PREFIXES[@]}"; do
         if _is_prefix_of "${_blocked_prefix}" "${canon}"; then
             echo "Error: ${context} '${canon}' is inside the blocked path '${_blocked_prefix}'." >&2
@@ -680,6 +683,71 @@ _check_path_safe() {
             exit 1
         fi
     done
+}
+
+# _build_blocked_prefixes
+#   Populate the _HOME_ROOTS and _BLOCKED_PREFIXES globals consumed by
+#   _check_path_safe.  Every home-derived blocked prefix is registered in both
+#   its logical form (built from _HOME) and its canonical form (built from
+#   _HOME_CANON); likewise /root and $XDG_DATA_HOME are registered in both
+#   logical and canonical form.  Computed once (three readlink -f forks total)
+#   so _check_path_safe never forks per candidate.
+#
+#   Must be called by resolve_common_paths after XDG_DATA_HOME is set and
+#   before any function that invokes _check_path_safe.
+_build_blocked_prefixes() {
+    # Home roots for the ancestor-of-home check (logical + canonical).
+    _HOME_ROOTS=("${_HOME}")
+    [[ "${_HOME_CANON}" != "${_HOME}" ]] && _HOME_ROOTS+=("${_HOME_CANON}")
+
+    local _xdg_data_canon _root_canon
+    _xdg_data_canon="$(readlink -f "${XDG_DATA_HOME}" 2> /dev/null || printf '%s' "${XDG_DATA_HOME}")"
+    _root_canon="$(readlink -f /root 2> /dev/null || printf '%s' /root)"
+
+    _BLOCKED_PREFIXES=()
+    local _home_root
+    for _home_root in "${_HOME_ROOTS[@]}"; do
+        _BLOCKED_PREFIXES+=(
+            # SSH / GPG / cloud keys
+            "${_home_root}/.ssh"
+            "${_home_root}/.gnupg"
+            "${_home_root}/.aws"
+            "${_home_root}/.kube"
+            "${_home_root}/.docker"
+            # Package-manager credentials
+            "${_home_root}/.netrc"
+            "${_home_root}/.pypirc"
+            "${_home_root}/.rattler"
+            "${_home_root}/.yarnrc"
+            "${_home_root}/.yarnrc.yml"
+            "${_home_root}/.yarn"
+            # Password managers
+            "${_home_root}/.password-store"   # pass / gopass encrypted secret store
+            "${_home_root}/.config/1Password" # 1Password CLI session/config
+            "${_home_root}/.config/op"        # 1Password CLI (alternate path)
+            # GitHub CLI tokens
+            "${_home_root}/.config/gh"
+        )
+    done
+
+    # uv per-index credentials under XDG_DATA_HOME (logical + canonical).
+    _BLOCKED_PREFIXES+=("${XDG_DATA_HOME}/uv/credentials")
+    [[ "${_xdg_data_canon}" != "${XDG_DATA_HOME}" ]] &&
+        _BLOCKED_PREFIXES+=("${_xdg_data_canon}/uv/credentials")
+
+    # System paths.
+    _BLOCKED_PREFIXES+=(
+        "/root"
+        "/etc/shadow"
+        "/etc/sudoers"
+        "/etc/sudoers.d"
+    )
+    [[ "${_root_canon}" != "/root" ]] && _BLOCKED_PREFIXES+=("${_root_canon}")
+
+    # Return success explicitly: the trailing `[[ ... ]] && ...` above yields a
+    # non-zero status when its condition is false, which under the callers'
+    # `set -e` would otherwise abort the whole run.
+    return 0
 }
 
 # _check_dir_safe PATH CONTEXT
@@ -805,7 +873,21 @@ build_extra_path_mounts() {
 
 resolve_common_paths() {
     _HOME="${HOME}"
-    _PWD="${PWD}"
+    # Canonical home: home may be reached through a symlink (e.g. /home ->
+    # /nfs/home on NFS/automount hosts).  Candidate paths are canonicalized
+    # with readlink -f before the safety checks, so the blocked-prefix list
+    # must be expressed in the canonical home too — otherwise a canonicalized
+    # candidate slips past a prefix that was built from the logical home.
+    _HOME_CANON="$(readlink -f "${HOME}" 2> /dev/null || printf '%s' "${HOME}")"
+
+    # Physical (symlink-resolved) working directory.  Using the physical path
+    # keeps PWD and the working-directory bind consistent with the canonical
+    # candidate checks below and with what actually exists inside the sandbox.
+    _PWD="$(pwd -P 2> /dev/null || printf '%s' "${PWD}")"
+
+    # Guarded username: $USER can be unset under `set -u` (cron/CI); fall back
+    # to `id -un` so USER/LOGNAME in the sandbox are always populated.
+    _USER="${USER:-$(id -un)}"
 
     # XDG defaults
     XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${_HOME}/.config}"
@@ -834,6 +916,9 @@ resolve_common_paths() {
 
     # npm paths
     NPM_CACHE_DIR="${NPM_CONFIG_CACHE:-${_HOME}/.npm}"
+
+    # Precompute the blocked-prefix / home-root lists (needs XDG_DATA_HOME).
+    _build_blocked_prefixes
 
     # ── Safety checks on all user-controllable path roots ────────
     # These variables are set from env vars (XDG_*, PIXI_HOME, CCACHE_DIR,
@@ -1128,17 +1213,25 @@ build_home_tmpfs() {
 # Otherwise fall back to binding just $PWD.
 # Sets globals: _BIND_DIR, _GIT_ROOT
 build_workdir_mount() {
+    # _PWD is the physical (pwd -P) working directory; git rev-parse
+    # --show-toplevel likewise returns a physical path.
     _BIND_DIR="${_PWD}"
     _GIT_ROOT="$(git -C "${_PWD}" rev-parse --show-toplevel 2> /dev/null || true)"
     if [[ -n "${_GIT_ROOT}" ]]; then
         _BIND_DIR="${_GIT_ROOT}"
     fi
 
+    # Canonicalize before the safety check.  Although pwd -P and git rev-parse
+    # already return physical paths, resolving once more with readlink -f
+    # guarantees a symlinked working directory cannot smuggle a blocked target
+    # (e.g. a cwd symlinked into ~/.ssh) past _check_path_safe, which compares
+    # the canonical candidate against the blocked-prefix list.
+    _BIND_DIR="$(readlink -f "${_BIND_DIR}" 2> /dev/null || printf '%s' "${_BIND_DIR}")"
+
     # Guard: reject dangerous working / git-root directories via the same
     # rules applied to --ro-path / --rw-path.  This catches $HOME itself,
     # ancestors of $HOME (/home, /), /root, ~/.ssh, and all other blocked
-    # prefixes.  _BIND_DIR comes from git rev-parse or $PWD — both are
-    # already canonical paths, so no readlink -f step is needed here.
+    # prefixes.
     _check_path_safe "${_BIND_DIR}" "working directory"
 
     # If the bind dir is under HOME, create intermediate directories in the
@@ -1312,8 +1405,8 @@ build_env_vars() {
     # Always set
     BWRAP_ARGS+=(
         --setenv HOME "${_HOME}"
-        --setenv USER "${USER}"
-        --setenv LOGNAME "${USER}"
+        --setenv USER "${_USER}"
+        --setenv LOGNAME "${_USER}"
         --setenv SHELL "${SANDBOX_SHELL}"
         --setenv PATH "${SANDBOX_PATH}"
         --setenv PWD "${_PWD}"
@@ -1458,8 +1551,8 @@ print_dry_run() {
     #   exec <env_bin> -i <vars> <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
     printf "exec %s -i \\\\\n" "${_ENV_BIN}"
     printf "  HOME=%q \\\\\n"    "${_HOME}"
-    printf "  USER=%q \\\\\n"    "${USER}"
-    printf "  LOGNAME=%q \\\\\n" "${USER}"
+    printf "  USER=%q \\\\\n"    "${_USER}"
+    printf "  LOGNAME=%q \\\\\n" "${_USER}"
     printf "  PATH=%q \\\\\n"    "/usr/bin:/bin"
     printf "  LANG=%q \\\\\n"    "${LANG:-C.UTF-8}"
     printf "  LC_CTYPE=%q \\\\\n" "${LC_CTYPE:-C.UTF-8}"
@@ -1525,8 +1618,8 @@ launch_sandbox() {
 
     exec "${_ENV_BIN}" -i \
         HOME="${_HOME}" \
-        USER="${USER}" \
-        LOGNAME="${USER}" \
+        USER="${_USER}" \
+        LOGNAME="${_USER}" \
         PATH="/usr/bin:/bin" \
         LANG="${LANG:-C.UTF-8}" \
         LC_CTYPE="${LC_CTYPE:-C.UTF-8}" \
