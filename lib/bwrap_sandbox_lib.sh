@@ -1202,7 +1202,7 @@ build_binary_masks() {
         # SSH
         ssh scp sftp ssh-agent ssh-add ssh-keygen ssh-keyscan
         # Network
-        telnet nc ncat netcat rsync rsh rlogin rexec
+        telnet nc ncat netcat socat rsync rsh rlogin rexec
         # Kerberos
         kinit klist kdestroy kswitch
         # Keyring
@@ -1667,19 +1667,18 @@ _bwrap_flag_arity() {
 #   tokens, and credentials forwarded by the bw* wrappers.
 _is_secret_env_var() {
     case "$1" in
-        # Generic suffix patterns
+        # Generic suffix patterns.  These already cover GH_TOKEN,
+        # GITHUB_TOKEN, ANTHROPIC_FOUNDRY_API_KEY, AIFAPIM_API_KEY,
+        # OPENAI_API_KEY, CODEX_API_KEY, and CODEX_ACCESS_TOKEN — all of which
+        # end in one of these suffixes — so they need no explicit entries.
         *_API_KEY | *_ACCESS_TOKEN | *_SECRET | *_PASSWORD | *_TOKEN)
-            return 0 ;;
-        # GitHub tokens (bare and prefixed)
-        GH_TOKEN | GITHUB_TOKEN | GH_TOKEN_*)
-            return 0 ;;
-        # Anthropic / AIFAPIM foundry
-        ANTHROPIC_FOUNDRY_API_KEY | AIFAPIM_API_KEY)
-            return 0 ;;
-        # OpenAI / Codex (also caught by *_API_KEY/*_ACCESS_TOKEN above,
-        # listed explicitly for clarity)
-        OPENAI_API_KEY | CODEX_API_KEY | CODEX_ACCESS_TOKEN)
-            return 0 ;;
+            return 0
+            ;;
+        # Prefixed GitHub tokens (e.g. GH_TOKEN_NSLS2): the suffix is the
+        # token name, not the literal "_TOKEN", so *_TOKEN does not catch it.
+        GH_TOKEN_*)
+            return 0
+            ;;
     esac
     return 1
 }
