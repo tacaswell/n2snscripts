@@ -102,6 +102,7 @@ SANDBOX_PATH=""
 SANDBOX_SHELL=""
 
 # bwrap capability flags (set by detect_bwrap_capabilities)
+HAS_ARGS_FD=0
 HAS_CLEARENV=0
 HAS_BIND_OVER_RO=0
 
@@ -151,12 +152,23 @@ _version_ge() {
 # grepping --help.
 #
 # Version history:
+#   0.1.7 - added --args FD (NUL-separated args from an inherited fd)
 #   0.5.0 - added --clearenv
 #   0.6.3 - bind over ro-bind works (can mask binaries inside /usr)
 detect_bwrap_capabilities() {
     local _bwrap_ver
     _bwrap_ver="$(bwrap --version)"
     _bwrap_ver="${_bwrap_ver##* }"            # "bubblewrap 0.11.0" -> "0.11.0"
+
+    # --args FD: Read NUL-separated arguments from an inherited file descriptor
+    # (added in 0.1.7, well before the 0.4.0 floor).  This keeps secrets out of
+    # /proc/<pid>/cmdline: forwarded credentials (API keys, tokens) are placed
+    # on bwrap's argv via --setenv, so a resident bwrap process exposes them to
+    # any local user via `ps auxww` or /proc/<pid>/cmdline.  Passing BWRAP_ARGS
+    # through --args FD instead of argv closes the leak.
+    # Fallback: pass arguments via argv (residual exposure on ancient hosts).
+    HAS_ARGS_FD=0
+    if _version_ge "${_bwrap_ver}" "0.1.7"; then HAS_ARGS_FD=1; fi
 
     # --clearenv: Start with an empty environment (added in 0.5.0)
     # Fallback: manually unset all host env vars with --unsetenv
@@ -1718,6 +1730,9 @@ print_dry_run() {
 
     # Mirror the exact invocation used by launch_sandbox:
     #   exec <env_bin> -i <vars> <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
+    # Note: the actual launch passes BWRAP_ARGS via `bwrap --args FD` (NUL-separated
+    # on an inherited fd) to keep secrets out of /proc/<pid>/cmdline; this dry-run
+    # output shows the arguments inline for human readability (with secrets redacted).
     printf "exec %s -i \\\\\n" "${_ENV_BIN}"
     printf "  HOME=%q \\\\\n"    "${_HOME}"
     printf "  USER=%q \\\\\n"    "${_USER}"
@@ -1780,17 +1795,63 @@ print_dry_run() {
 # `env` is resolved via resolve_env_bin (prefers /usr/bin/env) rather than
 # via PATH lookup at exec time — this prevents a user shell script named
 # "env" earlier on PATH from hijacking the launch.  See resolve_env_bin.
+#
+# Security: BWRAP_ARGS is passed via `bwrap --args FD` (NUL-separated args
+# on an inherited fd) rather than argv to keep secrets out of /proc/<pid>/cmdline.
+# Forwarded credentials (ANTHROPIC_FOUNDRY_API_KEY, AIFAPIM_API_KEY, OPENAI_API_KEY,
+# GH_TOKEN*, COPILOT_*, etc.) are placed in BWRAP_ARGS as `--setenv NAME VALUE`,
+# and bwrap stays resident as the session supervisor — so without --args FD,
+# any local user can read the tokens via `ps auxww` for the sandbox's entire
+# lifetime.  The tool command and its arguments stay on the command line (they
+# contain no secrets), only the bwrap configuration moves to the fd.
 launch_sandbox() {
     local _BWRAP_BIN _ENV_BIN
     _BWRAP_BIN="$(command -v bwrap)"
     _ENV_BIN="$(resolve_env_bin)"
 
-    exec "${_ENV_BIN}" -i \
-        HOME="${_HOME}" \
-        USER="${_USER}" \
-        LOGNAME="${_USER}" \
-        PATH="/usr/bin:/bin" \
-        LANG="${LANG:-C.UTF-8}" \
-        LC_CTYPE="${LC_CTYPE:-C.UTF-8}" \
-        "${_BWRAP_BIN}" "${BWRAP_ARGS[@]}" -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}
+    if [[ "${HAS_ARGS_FD}" -eq 1 ]]; then
+        # Modern path: stage BWRAP_ARGS in a temporary file (mode 0600), open it
+        # as an fd, unlink the path immediately (data stays alive via the open fd),
+        # then pass the fd to bwrap via --args.  This keeps secrets out of
+        # /proc/<pid>/cmdline.
+        local _args_fd _staged_args _arg _old_umask
+        # Create a 0600 temp file (mktemp creates mode 0600 by default, but we
+        # set umask 077 to be explicit and defend against any mktemp that might
+        # honor a permissive umask).  Save and restore the umask to avoid
+        # side effects.
+        _old_umask="$(umask)"
+        umask 077
+        _staged_args="$(mktemp --tmpdir bwrap-args.XXXXXX)"
+        umask "${_old_umask}"
+        # Write each BWRAP_ARGS element as a NUL-separated record.
+        for _arg in ${BWRAP_ARGS[@]+"${BWRAP_ARGS[@]}"}; do
+            printf '%s\0' "${_arg}"
+        done > "${_staged_args}"
+        # Open the file read-only as an fd, then immediately unlink it.
+        # The kernel keeps the data alive via the open fd; the filename
+        # disappears from /tmp so there is nothing to clean up on exit or signal.
+        exec {_args_fd}< "${_staged_args}"
+        rm -f "${_staged_args}"
+        # Launch bwrap with --args FD; the tool command stays on argv.
+        exec "${_ENV_BIN}" -i \
+            HOME="${_HOME}" \
+            USER="${_USER}" \
+            LOGNAME="${_USER}" \
+            PATH="/usr/bin:/bin" \
+            LANG="${LANG:-C.UTF-8}" \
+            LC_CTYPE="${LC_CTYPE:-C.UTF-8}" \
+            "${_BWRAP_BIN}" --args "${_args_fd}" -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}
+    else
+        # Fallback for bwrap < 0.1.7 (well below the 0.4.0 floor, extremely unlikely):
+        # pass BWRAP_ARGS via argv.  This exposes secrets in /proc/<pid>/cmdline for
+        # the sandbox's entire lifetime — any local user can read them via ps.
+        exec "${_ENV_BIN}" -i \
+            HOME="${_HOME}" \
+            USER="${_USER}" \
+            LOGNAME="${_USER}" \
+            PATH="/usr/bin:/bin" \
+            LANG="${LANG:-C.UTF-8}" \
+            LC_CTYPE="${LC_CTYPE:-C.UTF-8}" \
+            "${_BWRAP_BIN}" "${BWRAP_ARGS[@]}" -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}
+    fi
 }
