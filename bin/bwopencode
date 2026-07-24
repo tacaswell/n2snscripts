@@ -83,9 +83,6 @@ OC_CONFIG_BINDS=()
 # in the library), so it uses the library's default (no-op)
 # parse_wrapper_arg_hook.
 
-parse_wrapper_args() {
-    parse_wrapper_args_common "$@"
-}
 
 # Find the absolute path to the opencode binary on the host so we do
 # not depend on PATH lookup inside the sandbox.
@@ -350,11 +347,11 @@ build_opencode_env() {
 # ═══════════════════════════════════════════════════════════════════
 
 main() {
-    parse_wrapper_args "$@"
+    parse_wrapper_args_common "$@"
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
-        # show_help does exec, never returns
+        # wrapper_show_help exits 0, never execs
     fi
 
     resolve_tool_binary

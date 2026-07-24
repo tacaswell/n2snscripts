@@ -81,9 +81,6 @@ source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 # now live in the library), so it uses the library's default (no-op)
 # parse_wrapper_arg_hook.
 
-parse_wrapper_args() {
-    parse_wrapper_args_common "$@"
-}
 
 # Find the absolute path to the copilot binary on the host so we do
 # not depend on PATH lookup inside the sandbox.
@@ -264,10 +261,17 @@ build_copilot_home_mount() {
     elif [[ -f "${COPILOT_CONFIG_FILE}" ]]; then
         # Normal mode: copy config.json into tmpfs via --file
         # This makes host auth available but changes don't persist
-        local _fd
-        exec {_fd}< "${COPILOT_CONFIG_FILE}"
-        BWRAP_ARGS+=(--file "${_fd}" "${COPILOT_CONFIG_FILE}")
-        # Note: fd stays open until bwrap exec's, then it's inherited and used
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            # --dry-run must not stage anything on the host, and a real fd number
+            # would not be reproducible by copy-paste.  Emit a placeholder so the
+            # output shows the --file mount without the open fd.
+            BWRAP_ARGS+=(--file "<config-fd>" "${COPILOT_CONFIG_FILE}")
+        else
+            local _fd
+            exec {_fd}< "${COPILOT_CONFIG_FILE}"
+            BWRAP_ARGS+=(--file "${_fd}" "${COPILOT_CONFIG_FILE}")
+            # Note: fd stays open until bwrap exec's, then it's inherited and used
+        fi
     fi
 }
 
@@ -327,11 +331,11 @@ build_copilot_env() {
 # ═══════════════════════════════════════════════════════════════════
 
 main() {
-    parse_wrapper_args "$@"
+    parse_wrapper_args_common "$@"
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
-        # show_help does exec, never returns
+        # wrapper_show_help exits 0, never execs
     fi
 
     resolve_tool_binary
