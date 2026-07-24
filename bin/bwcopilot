@@ -45,11 +45,14 @@
 #   bwcopilot --help
 #
 # Options:
-#   --help, -h      Show this help (wrapper options + copilot's own help).
+#   --help, -h      Show this wrapper help and exit
 #   --dry-run       Print the bwrap command that would be executed without running it.
-#   --exec CMD      Run CMD inside the sandbox instead of copilot.
-#                   Useful for running one-off commands, scripts, or diagnostic tools
-#                   inside the fully-configured sandbox environment.
+#   --exec CMD...   Run CMD and its arguments verbatim inside the sandbox instead
+#                   of copilot (everything after --exec is taken literally).
+#                   Useful for running one-off commands, scripts, or diagnostic
+#                   tools inside the fully-configured sandbox environment.
+#   --github-tokens Forward any GH_TOKEN_* environment variables into the sandbox
+#                   so the agent can authenticate the gh(1) CLI.  Off by default.
 #   --init-auth     Persist auth tokens to host (run once on personal machines).
 #   --new-session   Force bwrap --new-session even on kernels with the TIOCSTI cap
 #                   guard.  Detaches the controlling tty for stricter isolation at the
@@ -72,71 +75,14 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 
 # ═══════════════════════════════════════════════════════════════════
-# Tool-specific state
-# ═══════════════════════════════════════════════════════════════════
-
-INIT_AUTH=0
-FORWARD_GH_TOKENS=0
-
-# ═══════════════════════════════════════════════════════════════════
 # Tool-specific functions
 # ═══════════════════════════════════════════════════════════════════
+# bwcopilot has no tool-specific state or flags (INIT_AUTH / FORWARD_GH_TOKENS
+# now live in the library), so it uses the library's default (no-op)
+# parse_wrapper_arg_hook.
 
 parse_wrapper_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --help | -h)
-                SHOW_HELP=1
-                shift
-                ;;
-            --dry-run)
-                DRY_RUN=1
-                shift
-                ;;
-            --exec)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --exec requires a command argument." >&2
-                    exit 1
-                fi
-                TEST_CMD="$2"
-                shift 2
-                ;;
-            --init-auth)
-                INIT_AUTH=1
-                shift
-                ;;
-            --github-tokens)
-                FORWARD_GH_TOKENS=1
-                shift
-                ;;
-            --new-session)
-                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh (sandboxed_exec)
-                FORCE_NEW_SESSION=1
-                shift
-                ;;
-            --ro-path)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --ro-path requires a path argument." >&2
-                    exit 1
-                fi
-                EXTRA_RO_PATHS+=("$2")
-                shift 2
-                ;;
-            --rw-path)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --rw-path requires a path argument." >&2
-                    exit 1
-                fi
-                EXTRA_RW_PATHS+=("$2")
-                shift 2
-                ;;
-            *)
-                break
-                ;;
-        esac
-    done
-    # shellcheck disable=SC2034  # consumed by library's print_dry_run/launch_sandbox
-    TOOL_ARGS=("$@")
+    parse_wrapper_args_common "$@"
 }
 
 # Find the absolute path to the copilot binary on the host so we do
@@ -146,33 +92,25 @@ parse_wrapper_args() {
 # archived/deprecated as of Oct 2025.
 # Sets globals: _TOOL_BIN, _TOOL_CMD
 resolve_tool_binary() {
-    _TOOL_BIN="$(command -v copilot 2> /dev/null || true)"
-    if [[ -z "${_TOOL_BIN}" ]]; then
-        echo "Error: 'copilot' not found in PATH." >&2
-        echo "Install the standalone GitHub Copilot CLI from https://github.com/github/copilot-cli" >&2
-        exit 1
-    fi
-
-    if [[ -n "${TEST_CMD}" ]]; then
-        # Split TEST_CMD into array so multi-word commands work correctly.
-        read -ra _TOOL_CMD <<< "${TEST_CMD}"
-    else
-        _TOOL_CMD=("${_TOOL_BIN}")
-    fi
+    resolve_tool_binary_named copilot \
+        "Install the standalone GitHub Copilot CLI from https://github.com/github/copilot-cli"
 }
 
 show_help() {
-    cat << 'HELP_EOF'
+    wrapper_show_help "$(
+                         cat << 'HELP_EOF'
 bwcopilot — GitHub Copilot CLI inside a bubblewrap sandbox
 
 Wrapper options (consumed before copilot sees the command line):
-  -h, --help      Show this message followed by copilot's own help.
+  -h, --help      Show this wrapper help and exit (never requires copilot to be
+                  installed).  For copilot's own options, run:
+                    bwcopilot --exec copilot --help
   --dry-run       Print the bwrap command that would be run, then exit.
-  --exec CMD      Run CMD inside the fully-configured sandbox instead of copilot.
-                  Use this to run scripts, diagnostic tools, or any command with
-                  the same filesystem isolation and environment as copilot itself.
+  --exec CMD...   Run CMD (with its arguments, verbatim) inside the fully-
+                  configured sandbox instead of copilot.  Everything after --exec
+                  is taken literally — no quote re-splitting.
                   Example: bwcopilot --exec bash
-                           bwcopilot --exec 'bash -c "env | sort"'
+                           bwcopilot --exec bash -c 'env | sort'
   --init-auth     Persist auth tokens to host (run once on personal machines).
   --new-session   Force bwrap to call setsid(2), detaching the sandbox from the
                   controlling terminal.  This is the default on older kernels
@@ -211,14 +149,8 @@ Authentication:
 Known limitation:
   copilot --config-dir /path is not supported (that path is not mounted).
   Use the COPILOT_HOME env var instead.
-
 HELP_EOF
-    # Delegate to copilot --help inside the sandbox so the user sees the full
-    # copilot option set in the same invocation.  Resolve the binary here so
-    # that --help works even when copilot is not installed — the wrapper text
-    # is shown first and the error only occurs if the tool is also needed.
-    resolve_tool_binary
-    exec "$0" --exec "${_TOOL_BIN} --help"
+    )"
 }
 
 # ── Copilot path resolution ─────────────────────────────────────
@@ -324,7 +256,9 @@ build_copilot_home_mount() {
             ( umask 077 && printf '{"banner": "never"}\n' > "${COPILOT_CONFIG_FILE}" )
             echo "Created ${COPILOT_CONFIG_FILE} — auth tokens will persist after this session." >&2
         fi
-        if [[ -f "${COPILOT_CONFIG_FILE}" ]]; then
+        # Bind unconditionally under --dry-run + --init-auth for fidelity (the
+        # stub above is not created on dry-run, but a real run would).
+        if _persist_bind_wanted "${COPILOT_CONFIG_FILE}"; then
             BWRAP_ARGS+=(--bind "${COPILOT_CONFIG_FILE}" "${COPILOT_CONFIG_FILE}")
         fi
     elif [[ -f "${COPILOT_CONFIG_FILE}" ]]; then
@@ -366,18 +300,19 @@ build_gh_auth_mount() {
 
 # ── Copilot env vars ────────────────────────────────────────────
 build_copilot_env() {
-    # Auth tokens
+    # Auth tokens.  GH_TOKEN/GITHUB_TOKEN are forwarded unconditionally (copilot
+    # requires GitHub auth to function); GH_TOKEN_* remain opt-in behind
+    # --github-tokens below.  These are not COPILOT_-prefixed, so the sweep does
+    # not cover them.
     pass_through_if_set GH_TOKEN
     pass_through_if_set GITHUB_TOKEN
     pass_through_if_set GH_HOST
 
-    # Copilot config
-    pass_through_if_set COPILOT_HOME
-    pass_through_if_set COPILOT_CACHE_HOME
-    pass_through_if_set COPILOT_MODEL
-
-    # Pass through any COPILOT_PROVIDER_* env vars.
-    forward_env_by_prefix COPILOT_PROVIDER_
+    # Forward every COPILOT_* env var in one sweep (COPILOT_HOME,
+    # COPILOT_CACHE_HOME, COPILOT_MODEL, COPILOT_PROVIDER_*, and any other
+    # COPILOT_* override) — matches the full-prefix sweep the sibling wrappers
+    # use for their own tool-prefixed vars.
+    forward_env_by_prefix COPILOT_
 
     # GitHub CLI token passthrough (opt-in via --github-tokens).
     # Values are passed through as-is; print_dry_run redacts them centrally

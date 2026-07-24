@@ -14,11 +14,18 @@
 #   - Environment variable framework (clean env + passthrough)
 #   - Launch logic (dry-run printing and bwrap exec)
 #
+# The common wrapper front-end lives here:
+#   - parse_wrapper_args_common — handles all shared flags (--help, --dry-run,
+#     --exec, --init-auth, --github-tokens, --new-session, --ro-path, --rw-path);
+#     delegates unknown flags to the wrapper's parse_wrapper_arg_hook
+#   - resolve_tool_binary_named — resolves the tool binary and builds _TOOL_CMD
+#     (verbatim --exec argv, or the tool binary)
+#   - wrapper_show_help — prints the wrapper's help text and exits 0
+#   - _persist_bind_wanted / init_auth stub helpers — --init-auth persistence
+#
 # Tool-specific wrapper scripts source this file and provide:
-#   - Argument parsing (parse_wrapper_args) — must handle --ro-path/--rw-path
-#     and accumulate values into the shared EXTRA_RO_PATHS/EXTRA_RW_PATHS arrays
-#   - Binary resolution (resolve_tool_binary) setting _TOOL_BIN and _TOOL_CMD
-#   - Help text (show_help)
+#   - parse_wrapper_arg_hook — handle any tool-specific flags (optional)
+#   - Help text passed to wrapper_show_help
 #   - Tool-specific path resolution, host directory creation, mounts, and env vars
 #   - main() orchestrating the build sequence — must call build_extra_path_mounts
 #     after build_dynamic_tool_mounts
@@ -40,17 +47,32 @@ _BWRAP_SANDBOX_LIB_SOURCED=1
 # Global state
 # ═══════════════════════════════════════════════════════════════════
 
-# Wrapper control flags (set by tool-specific parse_wrapper_args)
+# Wrapper control flags (set by the shared parse_wrapper_args_common)
 # shellcheck disable=SC2034  # used by tool wrappers that source this library
 DRY_RUN=0
+# --exec state.  HAVE_EXEC=1 when the user passed --exec; EXEC_CMD then holds
+# the verbatim remaining argv to run inside the sandbox instead of the tool.
+# (Replaces the old TEST_CMD string, which was word-split with `read -ra` and
+# therefore mangled any quoted --exec command.)
 # shellcheck disable=SC2034  # used by tool wrappers that source this library
-TEST_CMD=""
+HAVE_EXEC=0
+# shellcheck disable=SC2034  # used by tool wrappers that source this library
+EXEC_CMD=()
 # shellcheck disable=SC2034  # used by tool wrappers that source this library
 SHOW_HELP=0
 # shellcheck disable=SC2034  # used by print_dry_run and launch_sandbox
 TOOL_ARGS=()
 # shellcheck disable=SC2034  # set by tool wrappers when --new-session is requested
 FORCE_NEW_SESSION=0
+# Wrapper flags shared by every bw* wrapper (all four implement --init-auth and
+# --github-tokens); set by parse_wrapper_args_common.
+# shellcheck disable=SC2034  # used by tool wrappers that source this library
+INIT_AUTH=0
+# shellcheck disable=SC2034  # used by tool wrappers that source this library
+FORWARD_GH_TOKENS=0
+# Number of args consumed by the wrapper-specific hook (see
+# parse_wrapper_args_common / parse_wrapper_arg_hook).
+_ARG_SHIFT=0
 
 # Extra user-supplied paths to mount into the sandbox.
 # Populated by tool-specific parse_wrapper_args via --ro-path / --rw-path.
@@ -397,6 +419,141 @@ forward_env_by_prefix() {
             BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
         fi
     done < <(compgen -e)
+}
+
+# ── Shared wrapper front-end (arg parsing, tool resolution, help) ─
+# These helpers factor the near-identical boilerplate out of the four bw*
+# wrappers so that the --exec, --help, and --init-auth fixes live in one place.
+
+# parse_wrapper_args_common "$@"
+#   Parse the flags common to every bw* wrapper and populate TOOL_ARGS with the
+#   remaining passthrough arguments.  For any flag it does not recognize, it
+#   calls the wrapper-provided hook `parse_wrapper_arg_hook "$@"`, which must set
+#   the global _ARG_SHIFT to the number of args it consumed (0 = not a
+#   wrapper flag → stop parsing; the rest is passed through to the tool).
+#
+#   Common flags:
+#     --help/-h, --dry-run, --exec (consumes the REST of argv verbatim),
+#     --init-auth, --github-tokens, --new-session, --ro-path, --rw-path.
+#
+#   --exec consumes every remaining argument verbatim into EXEC_CMD; there is
+#   no quote re-splitting, so `--exec bash -c 'env | sort'` runs exactly that
+#   argv inside the sandbox.
+parse_wrapper_args_common() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help | -h)
+                # shellcheck disable=SC2034  # read by the wrapper's main()
+                SHOW_HELP=1
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --exec)
+                shift
+                if [[ $# -lt 1 ]]; then
+                    echo "Error: --exec requires a command to run." >&2
+                    exit 1
+                fi
+                HAVE_EXEC=1
+                EXEC_CMD=("$@")
+                shift $#
+                ;;
+            --init-auth)
+                INIT_AUTH=1
+                shift
+                ;;
+            --github-tokens)
+                # shellcheck disable=SC2034  # read by the wrapper's build_*_env
+                FORWARD_GH_TOKENS=1
+                shift
+                ;;
+            --new-session)
+                FORCE_NEW_SESSION=1
+                shift
+                ;;
+            --ro-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --ro-path requires a path argument." >&2
+                    exit 1
+                fi
+                EXTRA_RO_PATHS+=("$2")
+                shift 2
+                ;;
+            --rw-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --rw-path requires a path argument." >&2
+                    exit 1
+                fi
+                EXTRA_RW_PATHS+=("$2")
+                shift 2
+                ;;
+            *)
+                # Delegate to the wrapper's tool-specific flag handler.  If it
+                # does not recognize the token, parsing stops and the remainder
+                # is passed through to the tool.
+                _ARG_SHIFT=0
+                parse_wrapper_arg_hook "$@"
+                if [[ "${_ARG_SHIFT}" -gt 0 ]]; then
+                    shift "${_ARG_SHIFT}"
+                else
+                    break
+                fi
+                ;;
+        esac
+    done
+    # shellcheck disable=SC2034  # consumed by library's print_dry_run/launch_sandbox
+    TOOL_ARGS=("$@")
+}
+
+# Default no-op tool-specific flag hook.  Wrappers with extra flags (bwclaude,
+# bwcodex) override this; wrappers without (bwcopilot, bwopencode) inherit it.
+parse_wrapper_arg_hook() {
+    _ARG_SHIFT=0
+}
+
+# resolve_tool_binary_named NAME [HINT_LINE...]
+#   Resolve the absolute path to tool NAME on the host into _TOOL_BIN, and set
+#   _TOOL_CMD to the verbatim --exec argv (if --exec was given) or the tool
+#   binary itself.  Exits 1 with NAME plus any HINT_LINEs if NAME is not found.
+resolve_tool_binary_named() {
+    local _name="$1"
+    shift
+    _TOOL_BIN="$(command -v "${_name}" 2> /dev/null || true)"
+    if [[ -z "${_TOOL_BIN}" ]]; then
+        echo "Error: '${_name}' not found in PATH." >&2
+        local _hint
+        for _hint in "$@"; do
+            echo "${_hint}" >&2
+        done
+        exit 1
+    fi
+
+    if [[ "${HAVE_EXEC}" -eq 1 ]]; then
+        _TOOL_CMD=("${EXEC_CMD[@]}")
+    else
+        _TOOL_CMD=("${_TOOL_BIN}")
+    fi
+}
+
+# wrapper_show_help HELP_TEXT
+#   Print the wrapper's own help text and exit 0.  Deliberately does NOT run the
+#   tool or require credentials/config: `--help` must always succeed, even when
+#   the tool is not installed or no API key/config is present.  (The tool's own
+#   options remain reachable via, e.g., `bwclaude --exec claude --help`.)
+wrapper_show_help() {
+    printf '%s\n' "$1"
+    exit 0
+}
+
+# _persist_bind_wanted PATH
+#   True if PATH exists OR we are in --dry-run + --init-auth mode.  In the
+#   latter case a real run would have created the stub file and bound it, so we
+#   emit the bind for dry-run fidelity even though the stub was not created.
+_persist_bind_wanted() {
+    [[ -e "$1" ]] || { [[ "${INIT_AUTH}" -eq 1 ]] && [[ "${DRY_RUN}" -eq 1 ]]; }
 }
 
 # ── Path safety validation ───────────────────────────────────────

@@ -37,11 +37,14 @@
 #   bwopencode --help
 #
 # Options:
-#   --help, -h      Show this help (wrapper options + opencode's own help).
+#   --help, -h      Show this wrapper help and exit
 #   --dry-run       Print the bwrap command that would be executed without running it.
-#   --exec CMD      Run CMD inside the sandbox instead of opencode.
-#                   Useful for running one-off commands, scripts, or diagnostic tools
-#                   inside the fully-configured sandbox environment.
+#   --exec CMD...   Run CMD and its arguments verbatim inside the sandbox instead
+#                   of opencode (everything after --exec is taken literally).
+#                   Useful for running one-off commands, scripts, or diagnostic
+#                   tools inside the fully-configured sandbox environment.
+#   --github-tokens Forward any GH_TOKEN_* environment variables into the sandbox
+#                   so the agent can authenticate the gh(1) CLI.  Off by default.
 #   --init-auth     Create auth.json on the host so that GitHub OAuth tokens
 #                   persist across sessions.  Only needed once per account;
 #                   after that auth.json exists and is automatically persisted.
@@ -71,101 +74,41 @@ source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 # Tool-specific state
 # ═══════════════════════════════════════════════════════════════════
 
-INIT_AUTH=0
-FORWARD_GH_TOKENS=0
 OC_CONFIG_BINDS=()
 
 # ═══════════════════════════════════════════════════════════════════
 # Tool-specific functions
 # ═══════════════════════════════════════════════════════════════════
+# bwopencode has no tool-specific flags (INIT_AUTH / FORWARD_GH_TOKENS now live
+# in the library), so it uses the library's default (no-op)
+# parse_wrapper_arg_hook.
 
 parse_wrapper_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --help | -h)
-                SHOW_HELP=1
-                shift
-                ;;
-            --dry-run)
-                DRY_RUN=1
-                shift
-                ;;
-            --exec)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --exec requires a command argument." >&2
-                    exit 1
-                fi
-                TEST_CMD="$2"
-                shift 2
-                ;;
-            --init-auth)
-                INIT_AUTH=1
-                shift
-                ;;
-            --github-tokens)
-                FORWARD_GH_TOKENS=1
-                shift
-                ;;
-            --new-session)
-                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh (sandboxed_exec)
-                FORCE_NEW_SESSION=1
-                shift
-                ;;
-            --ro-path)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --ro-path requires a path argument." >&2
-                    exit 1
-                fi
-                EXTRA_RO_PATHS+=("$2")
-                shift 2
-                ;;
-            --rw-path)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --rw-path requires a path argument." >&2
-                    exit 1
-                fi
-                EXTRA_RW_PATHS+=("$2")
-                shift 2
-                ;;
-            *)
-                break
-                ;;
-        esac
-    done
-    # shellcheck disable=SC2034  # consumed by library's print_dry_run/launch_sandbox
-    TOOL_ARGS=("$@")
+    parse_wrapper_args_common "$@"
 }
 
 # Find the absolute path to the opencode binary on the host so we do
 # not depend on PATH lookup inside the sandbox.
 # Sets globals: _TOOL_BIN, _TOOL_CMD
 resolve_tool_binary() {
-    _TOOL_BIN="$(command -v opencode 2> /dev/null || true)"
-    if [[ -z "${_TOOL_BIN}" ]]; then
-        echo "Error: 'opencode' not found in PATH." >&2
-        exit 1
-    fi
-
-    if [[ -n "${TEST_CMD}" ]]; then
-        # Split TEST_CMD into array so multi-word commands work correctly.
-        read -ra _TOOL_CMD <<< "${TEST_CMD}"
-    else
-        _TOOL_CMD=("${_TOOL_BIN}")
-    fi
+    resolve_tool_binary_named opencode
 }
 
 show_help() {
-    cat << 'HELP_EOF'
+    wrapper_show_help "$(
+                         cat << 'HELP_EOF'
 bwopencode — opencode inside a bubblewrap sandbox
 
 Wrapper options (consumed before opencode sees the command line):
-  -h, --help      Show this message followed by opencode's own help.
+  -h, --help      Show this wrapper help and exit (never requires opencode to be
+                  installed).  For opencode's own options, run:
+                    bwopencode --exec opencode --help
   --dry-run       Print the bwrap command that would be run, then exit.
-  --exec CMD      Run CMD inside the fully-configured sandbox instead of opencode.
-                  Use this to run scripts, diagnostic tools, or any command with
-                  the same filesystem isolation and environment as opencode itself.
+  --exec CMD...   Run CMD (with its arguments, verbatim) inside the fully-
+                  configured sandbox instead of opencode.  Everything after
+                  --exec is taken literally — no quote re-splitting.
                   Example: bwopencode --exec bash
-                           bwopencode --exec 'bash -c "env | sort"'
+                           bwopencode --exec bash -c 'env | sort'
   --init-auth     Create auth.json on the host so GitHub OAuth tokens persist
                   across sessions.  Run once on a personal account; skip on
                   shared accounts (tokens will be ephemeral by default).
@@ -191,16 +134,8 @@ Wrapper options (consumed before opencode sees the command line):
                     GH_TOKEN="$GH_TOKEN_PERSONAL" gh issue list -R user/repo
 
 All other arguments are passed through to opencode unchanged.
-
 HELP_EOF
-    # Delegate to opencode --help inside the sandbox so the user sees the full
-    # opencode option set in the same invocation.  We re-exec this script with
-    # --exec so the sandbox is fully constructed; opencode --help is passed
-    # as the sandbox command.  Resolve the binary here (not in main) so that
-    # --help works even when opencode is not installed — the wrapper text is
-    # shown first and the error only occurs if the user expects tool help too.
-    resolve_tool_binary
-    exec "$0" --exec "${_TOOL_BIN} --help"
+    )"
 }
 
 resolve_opencode_paths() {
@@ -315,7 +250,11 @@ build_persistent_dotdir() {
     _repo_hash="$(printf '%s' "${_GIT_ROOT}" | sha256sum)"
     _repo_hash="${_repo_hash:0:16}"
     local _persist_dir="${OC_DATA_DIR}/project-dotfiles/${_repo_hash}"
-    mkdir -p "${_persist_dir}"
+    # Skip the host mkdir on --dry-run so that mode stays side-effect-free; the
+    # bind args are still emitted below for accurate dry-run output.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        mkdir -p "${_persist_dir}"
+    fi
 
     BWRAP_ARGS+=(
         --bind "${_persist_dir}" "${_GIT_ROOT}/.opencode"
@@ -371,7 +310,9 @@ build_opencode_data_mounts() {
             echo "Created ${OC_AUTH_FILE} — auth tokens will persist after this session." >&2
         fi
     fi
-    if [[ -f "${OC_AUTH_FILE}" ]]; then
+    # Bind unconditionally under --dry-run + --init-auth for fidelity (the stub
+    # above is not created on dry-run, but a real run would create and bind it).
+    if _persist_bind_wanted "${OC_AUTH_FILE}"; then
         BWRAP_ARGS+=(--bind "${OC_AUTH_FILE}" "${OC_AUTH_FILE}")
     fi
 }

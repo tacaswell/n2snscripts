@@ -33,17 +33,17 @@
 #         bind-mounted RW so writes persist across sessions at the cost of
 #         weaker isolation.  Either the user file or the system file
 #         (/etc/codex/config.toml) is sufficient for fail-fast.
-#   - /etc/codex/config.toml: system-wide provider/defaults config (if
-#       present); bind-mounted read-only.  Codex layers user config on
-#       top of this file.
-#   - /etc/codex/requirements.toml: admin-enforced restrictions (if
-#       present); bind-mounted read-only.  Users cannot loosen these.
 #     - AGENTS.md: bind-mounted read-only (if it exists)
 #     - skills/: bind-mounted read-only (if it exists)
 #     - packages/: bind-mounted read-only (if it exists, installer cache)
 #     - auth.json: bind-mounted read-write only if it already exists on host;
 #         --init-auth creates a {} stub for first-time ChatGPT-login setup
 #     - Everything else (tmp/, state.toml, features/, ...): tmpfs, discarded on exit
+#   - /etc/codex/config.toml: system-wide provider/defaults config (if
+#       present); bind-mounted read-only.  Codex layers user config on
+#       top of this file.
+#   - /etc/codex/requirements.toml: admin-enforced restrictions (if
+#       present); bind-mounted read-only.  Users cannot loosen these.
 #   - Codex CLI binary + npm prefix: read-only (handled by build_dynamic_tool_mounts)
 #   - Git config + includes: read-only
 #   - Pixi cache: read-write
@@ -67,11 +67,14 @@
 #   bwcodex --help
 #
 # Options:
-#   --help, -h      Show this help (wrapper options + codex's own help).
+#   --help, -h      Show this wrapper help and exit
 #   --dry-run       Print the bwrap command that would be executed without running it.
-#   --exec CMD      Run CMD inside the sandbox instead of codex.
-#                   Useful for running one-off commands, scripts, or diagnostic tools
-#                   inside the fully-configured sandbox environment.
+#   --exec CMD...   Run CMD and its arguments verbatim inside the sandbox instead
+#                   of codex (everything after --exec is taken literally).
+#                   Useful for running one-off commands, scripts, or diagnostic
+#                   tools inside the fully-configured sandbox environment.
+#   --github-tokens Forward any GH_TOKEN_* environment variables into the sandbox
+#                   so the agent can authenticate the gh(1) CLI.  Off by default.
 #   --init-auth     Create ~/.codex/auth.json on the host so that ChatGPT-login
 #                   OAuth tokens persist across sessions.  Only meaningful for the
 #                   BNL ITD ChatGPT subscription auth path; has no effect for
@@ -105,110 +108,56 @@ source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 # Tool-specific state
 # ═══════════════════════════════════════════════════════════════════
 
-INIT_AUTH=0
 DEBUG_MODE=0
 PERSIST_CONFIG=0
-FORWARD_GH_TOKENS=0
 
 # ═══════════════════════════════════════════════════════════════════
 # Tool-specific functions
 # ═══════════════════════════════════════════════════════════════════
 
+# Tool-specific flag handler (called by parse_wrapper_args_common for any flag
+# it does not itself recognize).  Sets _ARG_SHIFT to the number of args consumed.
+parse_wrapper_arg_hook() {
+    case "$1" in
+        --persist-config)
+            PERSIST_CONFIG=1
+            _ARG_SHIFT=1
+            ;;
+        --debug)
+            DEBUG_MODE=1
+            _ARG_SHIFT=1
+            ;;
+        *)
+            _ARG_SHIFT=0
+            ;;
+    esac
+}
+
 parse_wrapper_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --help | -h)
-                SHOW_HELP=1
-                shift
-                ;;
-            --dry-run)
-                DRY_RUN=1
-                shift
-                ;;
-            --exec)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --exec requires a command argument." >&2
-                    exit 1
-                fi
-                TEST_CMD="$2"
-                shift 2
-                ;;
-            --init-auth)
-                INIT_AUTH=1
-                shift
-                ;;
-            --persist-config)
-                PERSIST_CONFIG=1
-                shift
-                ;;
-            --debug)
-                DEBUG_MODE=1
-                shift
-                ;;
-            --github-tokens)
-                FORWARD_GH_TOKENS=1
-                shift
-                ;;
-            --new-session)
-                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh (sandboxed_exec)
-                FORCE_NEW_SESSION=1
-                shift
-                ;;
-            --ro-path)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --ro-path requires a path argument." >&2
-                    exit 1
-                fi
-                EXTRA_RO_PATHS+=("$2")
-                shift 2
-                ;;
-            --rw-path)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --rw-path requires a path argument." >&2
-                    exit 1
-                fi
-                EXTRA_RW_PATHS+=("$2")
-                shift 2
-                ;;
-            *)
-                break
-                ;;
-        esac
-    done
-    # shellcheck disable=SC2034  # consumed by library's print_dry_run/launch_sandbox
-    TOOL_ARGS=("$@")
+    parse_wrapper_args_common "$@"
 }
 
 # Find the absolute path to the codex binary on the host so we do
 # not depend on PATH lookup inside the sandbox.
 # Sets globals: _TOOL_BIN, _TOOL_CMD
 resolve_tool_binary() {
-    _TOOL_BIN="$(command -v codex 2> /dev/null || true)"
-    if [[ -z "${_TOOL_BIN}" ]]; then
-        echo "Error: 'codex' not found in PATH." >&2
-        exit 1
-    fi
-
-    if [[ -n "${TEST_CMD}" ]]; then
-        # Split TEST_CMD into array so multi-word commands work correctly.
-        read -ra _TOOL_CMD <<< "${TEST_CMD}"
-    else
-        _TOOL_CMD=("${_TOOL_BIN}")
-    fi
+    resolve_tool_binary_named codex
 }
 
 show_help() {
-    cat << 'HELP_EOF'
+    wrapper_show_help "$(
+                         cat << 'HELP_EOF'
 bwcodex — OpenAI Codex CLI inside a bubblewrap sandbox
 
 Wrapper options (consumed before codex sees the command line):
-  -h, --help      Show this message followed by codex's own help.
+  -h, --help      Show this wrapper help and exit (never requires codex config).
+                  For codex's own options, run:  bwcodex --exec codex --help
   --dry-run       Print the bwrap command that would be run, then exit.
-  --exec CMD      Run CMD inside the fully-configured sandbox instead of codex.
-                  Use this to run scripts, diagnostic tools, or any command with
-                  the same filesystem isolation and environment as codex itself.
+  --exec CMD...   Run CMD (with its arguments, verbatim) inside the fully-
+                  configured sandbox instead of codex.  Everything after --exec
+                  is taken literally — no quote re-splitting.
                   Example: bwcodex --exec bash
-                           bwcodex --exec 'bash -c "env | sort"'
+                           bwcodex --exec bash -c 'env | sort'
   --init-auth     Create ~/.codex/auth.json on the host so that ChatGPT-login
                   OAuth tokens persist across sessions.  Only meaningful for the
                   BNL ITD ChatGPT subscription auth path; has no effect for
@@ -254,14 +203,8 @@ Authentication:
                          for the [model_providers.nsls2-hermes] block.
     - ChatGPT login:     run `bwcodex --init-auth` once, then `bwcodex` and
                          `codex login` to populate ~/.codex/auth.json.
-
 HELP_EOF
-    # Delegate to codex --help inside the sandbox so the user sees the full
-    # codex option set in the same invocation.  Resolve the binary here so
-    # that --help works even when codex is not installed — the wrapper text
-    # is shown first and the error only occurs if the tool is also needed.
-    resolve_tool_binary
-    exec "$0" --exec "${_TOOL_BIN} --help"
+    )"
 }
 
 resolve_codex_paths() {
@@ -363,6 +306,11 @@ build_codex_home_mount() {
     if [[ -f "${CODEX_CONFIG_FILE}" ]]; then
         if [[ "${PERSIST_CONFIG}" -eq 1 ]]; then
             BWRAP_ARGS+=(--bind "${CODEX_CONFIG_FILE}" "${CODEX_CONFIG_FILE}")
+        elif [[ "${DRY_RUN}" -eq 1 ]]; then
+            # --dry-run must not stage anything on the host, and a real fd number
+            # would not be reproducible by copy-paste.  Emit a placeholder so the
+            # output shows the --file mount without the mktemp/cp/exec/rm dance.
+            BWRAP_ARGS+=(--file "<config-fd>" "${CODEX_CONFIG_FILE}")
         else
             local _config_fd _staged_config
             _staged_config="$(mktemp --tmpdir bwcodex-config.XXXXXX.toml)"
@@ -397,7 +345,9 @@ build_codex_home_mount() {
             echo "Created ${CODEX_AUTH_FILE} — auth tokens will persist after this session." >&2
         fi
     fi
-    if [[ -f "${CODEX_AUTH_FILE}" ]]; then
+    # Bind unconditionally under --dry-run + --init-auth for fidelity (the stub
+    # above is not created on dry-run, but a real run would create and bind it).
+    if _persist_bind_wanted "${CODEX_AUTH_FILE}"; then
         BWRAP_ARGS+=(--bind "${CODEX_AUTH_FILE}" "${CODEX_AUTH_FILE}")
     fi
 }

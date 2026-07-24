@@ -46,12 +46,15 @@
 #   bwclaude --help
 #
 # Options:
-#   --help, -h      Show this help (wrapper options + claude's own help).
+#   --help, -h      Show this wrapper help and exit
 #   --dry-run       Print the bwrap command that would be executed without running it.
-#   --exec CMD      Run CMD inside the sandbox instead of claude.
-#                   Useful for running one-off commands, scripts, or diagnostic tools
-#                   inside the fully-configured sandbox environment.
+#   --exec CMD...   Run CMD and its arguments verbatim inside the sandbox instead
+#                   of claude (everything after --exec is taken literally).
+#                   Useful for running one-off commands, scripts, or diagnostic
+#                   tools inside the fully-configured sandbox environment.
 #   --init-auth     Persist auth credentials to host (run once on personal machines).
+#   --github-tokens Forward any GH_TOKEN_* environment variables into the sandbox
+#                   so the agent can authenticate the gh(1) CLI.  Off by default.
 #   --debug         Enable verbose debug logging (ANTHROPIC_LOG=debug, NODE_DEBUG, --debug --verbose).
 #                   NOTE: shadows claude's own -d/--debug [filter] flag.  To pass a debug
 #                   filter to claude directly, place it after a non-wrapper argument so
@@ -81,105 +84,52 @@ source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 # Tool-specific state
 # ═══════════════════════════════════════════════════════════════════
 
-INIT_AUTH=0
 DEBUG_MODE=0
-FORWARD_GH_TOKENS=0
 
 # ═══════════════════════════════════════════════════════════════════
 # Tool-specific functions
 # ═══════════════════════════════════════════════════════════════════
 
+# Tool-specific flag handler (called by parse_wrapper_args_common for any flag
+# it does not itself recognize).  Sets _ARG_SHIFT to the number of args consumed.
+parse_wrapper_arg_hook() {
+    case "$1" in
+        --debug)
+            DEBUG_MODE=1
+            _ARG_SHIFT=1
+            ;;
+        *)
+            _ARG_SHIFT=0
+            ;;
+    esac
+}
+
 parse_wrapper_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --help | -h)
-                SHOW_HELP=1
-                shift
-                ;;
-            --dry-run)
-                DRY_RUN=1
-                shift
-                ;;
-            --exec)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --exec requires a command argument." >&2
-                    exit 1
-                fi
-                TEST_CMD="$2"
-                shift 2
-                ;;
-            --init-auth)
-                INIT_AUTH=1
-                shift
-                ;;
-            --debug)
-                DEBUG_MODE=1
-                shift
-                ;;
-            --github-tokens)
-                FORWARD_GH_TOKENS=1
-                shift
-                ;;
-            --new-session)
-                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh (sandboxed_exec)
-                FORCE_NEW_SESSION=1
-                shift
-                ;;
-            --ro-path)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --ro-path requires a path argument." >&2
-                    exit 1
-                fi
-                EXTRA_RO_PATHS+=("$2")
-                shift 2
-                ;;
-            --rw-path)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --rw-path requires a path argument." >&2
-                    exit 1
-                fi
-                EXTRA_RW_PATHS+=("$2")
-                shift 2
-                ;;
-            *)
-                break
-                ;;
-        esac
-    done
-    # shellcheck disable=SC2034  # consumed by library's print_dry_run/launch_sandbox
-    TOOL_ARGS=("$@")
+    parse_wrapper_args_common "$@"
 }
 
 # Find the absolute path to the claude binary on the host so we do
 # not depend on PATH lookup inside the sandbox.
 # Sets globals: _TOOL_BIN, _TOOL_CMD
 resolve_tool_binary() {
-    _TOOL_BIN="$(command -v claude 2> /dev/null || true)"
-    if [[ -z "${_TOOL_BIN}" ]]; then
-        echo "Error: 'claude' not found in PATH." >&2
-        exit 1
-    fi
-
-    if [[ -n "${TEST_CMD}" ]]; then
-        # Split TEST_CMD into array so multi-word commands work correctly.
-        read -ra _TOOL_CMD <<< "${TEST_CMD}"
-    else
-        _TOOL_CMD=("${_TOOL_BIN}")
-    fi
+    resolve_tool_binary_named claude
 }
 
 show_help() {
-    cat << 'HELP_EOF'
+    wrapper_show_help "$(
+                         cat << 'HELP_EOF'
 bwclaude — Claude CLI inside a bubblewrap sandbox
 
 Wrapper options (consumed before claude sees the command line):
-  -h, --help      Show this message followed by claude's own help.
+  -h, --help      Show this wrapper help and exit (never requires an API key or
+                  claude to be installed).  For claude's own options, run:
+                    bwclaude --exec claude --help
   --dry-run       Print the bwrap command that would be run, then exit.
-  --exec CMD      Run CMD inside the fully-configured sandbox instead of claude.
-                  Use this to run scripts, diagnostic tools, or any command with
-                  the same filesystem isolation and environment as claude itself.
+  --exec CMD...   Run CMD (with its arguments, verbatim) inside the fully-
+                  configured sandbox instead of claude.  Everything after --exec
+                  is taken literally — no quote re-splitting.
                   Example: bwclaude --exec bash
-                           bwclaude --exec 'bash -c "env | sort"'
+                           bwclaude --exec bash -c 'env | sort'
   --init-auth     Persist auth credentials to host (run once on personal machines).
   --debug         Enable verbose debug logging (sets ANTHROPIC_LOG=debug,
                   NODE_DEBUG=http,https,tls, and passes --debug --verbose to claude).
@@ -215,14 +165,8 @@ Authentication:
   for the current session but are discarded on exit.  This is intentional for
   shared accounts.  On a personal machine, run once with --init-auth to persist:
     bwclaude --init-auth
-
 HELP_EOF
-    # Delegate to claude --help inside the sandbox so the user sees the full
-    # claude option set in the same invocation.  Resolve the binary here so
-    # that --help works even when claude is not installed — the wrapper text
-    # is shown first and the error only occurs if the tool is also needed.
-    resolve_tool_binary
-    exec "$0" --exec "${_TOOL_BIN} --help"
+    )"
 }
 
 resolve_claude_paths() {
@@ -301,8 +245,10 @@ build_claude_home_mount() {
         echo "Created ${_settings_path} — settings will persist after this session." >&2
     fi
 
-    # settings.json: read-write if it exists (claude may update it during the session)
-    if [[ -e "${_settings_path}" ]]; then
+    # settings.json: read-write if it exists (claude may update it during the
+    # session).  Under --dry-run + --init-auth the stub above is not created, so
+    # emit the bind unconditionally for dry-run fidelity (a real run would).
+    if _persist_bind_wanted "${_settings_path}"; then
         BWRAP_ARGS+=(--bind "${_settings_path}" "${_settings_path}")
     fi
 
@@ -319,7 +265,8 @@ build_claude_home_mount() {
             ( umask 077 && printf '{}' > "${CLAUDE_CREDENTIALS_FILE}" )
             echo "Created ${CLAUDE_CREDENTIALS_FILE} — credentials will persist after this session." >&2
         fi
-        if [[ -f "${CLAUDE_CREDENTIALS_FILE}" ]]; then
+        # Bind unconditionally under --dry-run + --init-auth for fidelity.
+        if _persist_bind_wanted "${CLAUDE_CREDENTIALS_FILE}"; then
             BWRAP_ARGS+=(--bind "${CLAUDE_CREDENTIALS_FILE}" "${CLAUDE_CREDENTIALS_FILE}")
         fi
     elif [[ -f "${CLAUDE_CREDENTIALS_FILE}" ]]; then
@@ -338,7 +285,9 @@ build_claude_home_mount() {
     if [[ ! -f "${CLAUDE_STATE_FILE}" ]] && [[ "${DRY_RUN}" -eq 0 ]]; then
         ( umask 077 && printf '{}' > "${CLAUDE_STATE_FILE}" )
     fi
-    if [[ -f "${CLAUDE_STATE_FILE}" ]]; then
+    # A real run always creates + binds the state file, so emit the bind under
+    # --dry-run too (where the stub above is intentionally not created).
+    if [[ -f "${CLAUDE_STATE_FILE}" ]] || [[ "${DRY_RUN}" -eq 1 ]]; then
         BWRAP_ARGS+=(--bind "${CLAUDE_STATE_FILE}" "${CLAUDE_STATE_FILE}")
     fi
 }
@@ -422,11 +371,17 @@ build_claude_env() {
     if [[ "${DEBUG_MODE}" -eq 1 ]]; then
         BWRAP_ARGS+=(--setenv ANTHROPIC_LOG debug)
         BWRAP_ARGS+=(--setenv NODE_DEBUG "http,https,tls")
-        # Prepend --debug --verbose to the args passed to claude.
-        if [[ "${#TOOL_ARGS[@]}" -gt 0 ]]; then
-            TOOL_ARGS=(--debug --verbose "${TOOL_ARGS[@]}")
-        else
-            TOOL_ARGS=(--debug --verbose)
+        # Prepend claude's own --debug --verbose flags — but ONLY when we are
+        # actually launching claude.  Under --exec the sandbox command is not
+        # claude (e.g. `bwclaude --debug --exec bash`), so injecting these flags
+        # would run `bash --debug --verbose`.  EXEC_CMD carries the --exec argv
+        # verbatim and TOOL_ARGS is empty in that case.
+        if [[ "${HAVE_EXEC}" -eq 0 ]]; then
+            if [[ "${#TOOL_ARGS[@]}" -gt 0 ]]; then
+                TOOL_ARGS=(--debug --verbose "${TOOL_ARGS[@]}")
+            else
+                TOOL_ARGS=(--debug --verbose)
+            fi
         fi
     fi
 }
