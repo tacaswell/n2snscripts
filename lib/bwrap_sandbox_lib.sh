@@ -1325,7 +1325,10 @@ build_binary_masks() {
         # SSH
         ssh scp sftp ssh-agent ssh-add ssh-keygen ssh-keyscan
         # Network
-        telnet nc ncat netcat socat rsync rsh rlogin rexec
+        # NOTE: socat is deliberately NOT masked — Claude Code's built-in
+        # bwrap sandbox uses socat internally, and masking it breaks that
+        # functionality inside our outer sandbox.
+        telnet nc ncat netcat rsync rsh rlogin rexec
         # Kerberos
         kinit klist kdestroy kswitch
         # Keyring
