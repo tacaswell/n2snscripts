@@ -32,6 +32,13 @@ Every `bw*` wrapper accepts these options:
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
 | `--ro-path PATH` | Mount `PATH` (file or directory) read-only into the sandbox. May be repeated. Dangerous paths are blocked (see wrapper help for full list) |
 | `--rw-path PATH` | Mount `PATH` (file or directory) read-write into the sandbox. May be repeated. Same blocked-path rules as `--ro-path` |
+
+`--ro-path` and `--rw-path` may be nested: mounts are applied so that a path
+nested under another overrides it. This lets you expose a directory writable
+while keeping a specific subdirectory read-only —
+`--rw-path DIR --ro-path DIR/sub` mounts `DIR` read-write but `DIR/sub`
+read-only (and the reverse works too: a read-only tree with one writable
+subdir). A path given as both `--ro-path` and `--rw-path` is rejected.
 | `--github-tokens` | Forward any `GH_TOKEN_*` environment variables into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 Tool-specific options are listed in each wrapper's section below.

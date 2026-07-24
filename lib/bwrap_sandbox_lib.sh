@@ -999,91 +999,124 @@ validate_extra_path() {
 
 # build_extra_path_mounts
 #   Mount all paths accumulated in EXTRA_RO_PATHS and EXTRA_RW_PATHS.
-#   Each path is validated by validate_extra_path before mounting.
+#   Each path is validated by validate_extra_path (which runs _check_path_safe)
+#   before mounting.
 #
-#   Read-only paths: use _mount_ro_dir_if_needed for directories
-#     (deduplication via _MOUNTED_PREFIXES); for files, emit --ro-bind
-#     directly (no dedup needed — an individual file bind never subsumes
-#     a directory tree).
+#   Binds are emitted ANCESTORS-FIRST across both modes: bwrap applies binds in
+#   order and the last one covering a mount point wins, so a path nested under
+#   another is emitted after its parent and correctly overrides it.  This lets
+#       --rw-path parent --ro-path parent/child
+#   protect a specific subdirectory (writable parent, read-only child), and
+#   equally the reverse (read-only tree with one writable subdir).
 #
-#   Read-write paths: emit --bind directly for both files and directories.
-#     For paths under $HOME, intermediate --dir entries are created first
-#     so the bind mount point exists in the tmpfs.
+#   User paths are emitted DIRECTLY (not through the _MOUNTED_PREFIXES dedup
+#   used for automatic tool/system mounts): that dedup would skip a child
+#   already "covered" by a parent bind and defeat the nesting — and would also
+#   block protecting a subdirectory of the already-bound working directory.
 #
-#   Must be called AFTER build_dynamic_tool_mounts (which pre-populates
-#   _MOUNTED_PREFIXES) and AFTER build_home_tmpfs (which creates the
-#   $HOME tmpfs that intermediate --dir entries populate).
+#   Must be called AFTER the automatic mount steps (workdir, tool, system,
+#   home) so an explicit --ro-path/--rw-path can override them, and AFTER
+#   build_home_tmpfs (which creates the $HOME tmpfs that intermediate --dir
+#   entries populate).
 build_extra_path_mounts() {
-    local _raw_path _canon _target
-    local -a _ro_canon=() _rw_canon=()
+    # Nothing to do if the user passed no extra paths.
+    [[ ${#EXTRA_RO_PATHS[@]} -eq 0 && ${#EXTRA_RW_PATHS[@]} -eq 0 ]] && return 0
 
-    # Validate everything up front (canonicalizing each path) so RO/RW nesting
-    # can be cross-checked before any mount is emitted.  The explicit `|| exit`
-    # matters because validate_extra_path runs in a command substitution here:
-    # its own `exit 1` only terminates the subshell, so we must propagate it
-    # rather than let the loop continue with an empty canonical path.
+    local _raw_path _canon _mode
+    local -A _mode_of=()
+
+    # Validate everything up front (canonicalizing each path) via a command
+    # substitution.  The explicit `|| exit` matters: validate_extra_path's own
+    # `exit 1` only terminates the subshell, so we must propagate it rather than
+    # continue with an empty canonical path.
     for _raw_path in "${EXTRA_RO_PATHS[@]+"${EXTRA_RO_PATHS[@]}"}"; do
         _canon="$(validate_extra_path "${_raw_path}" "ro")" || exit 1
-        _ro_canon+=("${_canon}")
+        _mode_of["${_canon}"]="ro"
     done
     for _raw_path in "${EXTRA_RW_PATHS[@]+"${EXTRA_RW_PATHS[@]}"}"; do
         _canon="$(validate_extra_path "${_raw_path}" "rw")" || exit 1
-        _rw_canon+=("${_canon}")
+        # A path given as BOTH --ro-path and --rw-path is contradictory.
+        if [[ "${_mode_of["${_canon}"]:-}" == "ro" ]]; then
+            echo "Error: '${_canon}' was given as both --ro-path and --rw-path." >&2
+            echo "       A path cannot be mounted read-only and read-write at once." >&2
+            exit 1
+        fi
+        _mode_of["${_canon}"]="rw"
     done
 
-    # ── RO-under-RW nesting guard ────────────────────────────────
-    # bwrap applies binds in order, and this function emits every --ro-bind
-    # before every --bind.  An explicit --ro-path that is the same as, or
-    # nested under, a --rw-path would therefore be silently re-covered by the
-    # later parent --bind and become WRITABLE.  Fail closed instead of granting
-    # unintended write access.  (The reverse — a --rw-path nested under a
-    # --ro-path — is the legitimate "read-only tree with one writable subdir"
-    # pattern and is allowed: the child --bind correctly overrides the parent.)
-    local _ro _rw
-    for _ro in "${_ro_canon[@]+"${_ro_canon[@]}"}"; do
-        for _rw in "${_rw_canon[@]+"${_rw_canon[@]}"}"; do
-            if _is_prefix_of "${_rw}" "${_ro}"; then
-                echo "Error: --ro-path '${_ro}' is the same as or nested under --rw-path '${_rw}'." >&2
-                echo "       The read-write mount would override it and expose it writable." >&2
-                echo "       Refusing to mount — narrow the --rw-path or drop the --ro-path." >&2
-                exit 1
+    # Order the paths ancestors-first.  A plain LC_ALL=C sort suffices because
+    # an ancestor path is a byte prefix of its descendants, so it sorts before
+    # them.  (Limitation: a path containing a newline is not ordered reliably —
+    # sort is line-based; such paths are pathological and out of scope.)
+    local -a _all_canon=() _sorted=()
+    for _canon in "${!_mode_of[@]}"; do
+        _all_canon+=("${_canon}")
+    done
+    mapfile -t _sorted < <(printf '%s\n' "${_all_canon[@]}" | LC_ALL=C sort)
+
+    # Collect the destinations of every bind already emitted (workdir, tool,
+    # system, home, and — as we go — earlier extra paths).  A path whose
+    # ancestor is already bind-mounted needs no intermediate --dir entries: the
+    # ancestor's real host tree already contains it, and emitting a --dir on top
+    # of an existing bind would clobber that bind.  _bwrap_flag_arity keeps the
+    # walk aligned across variable-arity flags.
+    local -A _bound_dests=()
+    local _bi=0 _bflag _barity
+    while [[ ${_bi} -lt ${#BWRAP_ARGS[@]} ]]; do
+        _bflag="${BWRAP_ARGS[${_bi}]}"
+        _barity="$(_bwrap_flag_arity "${_bflag}")"
+        case "${_bflag}" in
+            --bind | --bind-try | --ro-bind | --ro-bind-try | --dev-bind | --dev-bind-try)
+                # Two-arg bind: SRC at _bi+1, DEST (the mount point) at _bi+2.
+                _bound_dests["${BWRAP_ARGS[$((_bi + 2))]}"]=1
+                ;;
+        esac
+        _bi=$((_bi + 1 + _barity))
+    done
+
+    local _anc
+    for _canon in "${_sorted[@]}"; do
+        _mode="${_mode_of["${_canon}"]}"
+
+        # Does any already-bound ancestor make this path reachable already?
+        local _has_bound_ancestor=0
+        _anc="${_canon%/*}"
+        [[ -z "${_anc}" ]] && _anc="/"
+        while :; do
+            if [[ -n "${_bound_dests["${_anc}"]:-}" ]]; then
+                _has_bound_ancestor=1
+                break
             fi
+            [[ "${_anc}" == "/" ]] && break
+            _anc="${_anc%/*}"
+            [[ -z "${_anc}" ]] && _anc="/"
         done
-    done
 
-    # ── Read-only extra paths ────────────────────────────────────
-    for _canon in "${_ro_canon[@]+"${_ro_canon[@]}"}"; do
-        if [[ -d "${_canon}" ]]; then
-            # Directories: go through the dedup helper.
-            _mount_ro_dir_if_needed "${_canon}"
-        else
-            # Files: --ro-bind directly.  Pre-create the file's parent
-            # directory chain if it lives under $HOME (the tmpfs has no
-            # subdirs yet); the file itself is the bind mount point.
-            _emit_home_intermediate_dirs "${_canon%/*}" inclusive
+        # Pre-create intermediate --dir entries only when no bound ancestor
+        # already provides the path (otherwise the --dir would clobber it).
+        # _emit_home_intermediate_dirs is a no-op for paths outside $HOME.
+        if [[ ${_has_bound_ancestor} -eq 0 ]]; then
+            if [[ -d "${_canon}" && "${_mode}" == "rw" ]]; then
+                # RW dir: include the target in the chain (the --bind lands on
+                # top of that --dir).
+                _emit_home_intermediate_dirs "${_canon}" inclusive
+            elif [[ -d "${_canon}" ]]; then
+                # RO dir: the --ro-bind creates the mount point, so only its
+                # ancestors need pre-creating.
+                _emit_home_intermediate_dirs "${_canon}"
+            else
+                # File (either mode): pre-create the parent directory chain.
+                _emit_home_intermediate_dirs "${_canon%/*}" inclusive
+            fi
+        fi
+
+        if [[ "${_mode}" == "ro" ]]; then
             BWRAP_ARGS+=(--ro-bind "${_canon}" "${_canon}")
-        fi
-    done
-
-    # ── Read-write extra paths ───────────────────────────────────
-    for _canon in "${_rw_canon[@]+"${_rw_canon[@]}"}"; do
-        # Pre-create the intermediate --dir chain when the path is under
-        # $HOME.  For a directory the chain includes the target itself (the
-        # subsequent --bind lands on top of that --dir); for a file the
-        # chain stops at the parent directory.
-        if [[ -d "${_canon}" ]]; then
-            _target="${_canon}"
         else
-            _target="${_canon%/*}"
+            BWRAP_ARGS+=(--bind "${_canon}" "${_canon}")
         fi
-        _emit_home_intermediate_dirs "${_target}" inclusive
-
-        BWRAP_ARGS+=(--bind "${_canon}" "${_canon}")
-
-        # Register RW directory trees so any later mount attempt is
-        # de-duplicated against them (RO paths were emitted above; only RW
-        # dirs were previously left unregistered in _MOUNTED_PREFIXES).
-        [[ -d "${_canon}" ]] && _MOUNTED_PREFIXES["${_canon}"]=1
+        # Record this bind so a nested child skips its intermediate --dir.
+        _bound_dests["${_canon}"]=1
     done
 }
 
