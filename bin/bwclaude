@@ -195,17 +195,17 @@ resolve_claude_paths() {
 
     CLAUDE_CREDENTIALS_FILE="${CLAUDE_HOME_DIR}/.credentials.json"
 
-    # State file: ~/.claude.json by default, but relocates into CLAUDE_CONFIG_DIR
-    # when that var is set (verified by inspecting the Claude CLI binary).
-    if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
-        # Canonicalize the user-provided path; the state file sits inside it.
-        local _config_dir_canon
-        _config_dir_canon="$(readlink -f "${CLAUDE_CONFIG_DIR}" 2> /dev/null || echo "${CLAUDE_CONFIG_DIR}")"
-        CLAUDE_STATE_FILE="${_config_dir_canon}/.claude.json"
-        # Validate: the state file is under CLAUDE_CONFIG_DIR, which was already checked above.
-    else
-        CLAUDE_STATE_FILE="${_HOME}/.claude.json"
-    fi
+    # State file lives at $CLAUDE_CONFIG_DIR/.claude.json (verified by inspecting
+    # the Claude CLI binary).  build_claude_env ALWAYS forces
+    # CLAUDE_CONFIG_DIR=${CLAUDE_HOME_DIR} inside the sandbox, so the tool always
+    # reads/writes its state at ${CLAUDE_HOME_DIR}/.claude.json — regardless of
+    # whether the host shell exported CLAUDE_CONFIG_DIR.  Key the bound host path
+    # on CLAUDE_HOME_DIR to match; keying it on the host's CLAUDE_CONFIG_DIR
+    # instead (falling back to ~/.claude.json) binds a path the tool never reads,
+    # so onboarding/theme/trust get written to the unbound tmpfs copy and are lost
+    # on exit — re-running the onboarding flow on every launch.
+    # CLAUDE_HOME_DIR is already canonicalized + _check_path_safe'd above.
+    CLAUDE_STATE_FILE="${CLAUDE_HOME_DIR}/.claude.json"
     # Canonicalize and validate the state file path itself before bind-mounting.
     if [[ -e "${CLAUDE_STATE_FILE}" ]]; then
         local _state_canon
