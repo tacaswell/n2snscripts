@@ -39,9 +39,8 @@
 #   indirection through `eval "value=\${$name:-}"`; the name is first
 #   validated to be a plain shell identifier (and rejected if it starts with
 #   the reserved __gpgpw_ prefix), so the eval can neither inject code nor
-#   read one of this function's own locals. A `local -n` nameref would be the
-#   bash idiom, but namerefs do not exist in zsh and this library is sourced
-#   from both bash and zsh startup files.
+#   read one of this function's own locals. Bash `local -n` namerefs are not
+#   available in zsh, so eval indirection is the portable alternative.
 
 # Guard against double-sourcing.
 [[ -n "${_GPG_PASSWD_LIB_SOURCED:-}" ]] && return 0
@@ -103,8 +102,8 @@ decrypt_env_file() {
                 return 2
                 ;;
         esac
-        # Indirect read via eval (zsh has no `local -n` nameref).  Safe: the
-        # name is a validated identifier, so only the caller's variable is read.
+        # eval indirection for portability: `local -n` namerefs are bash-only.
+        # Safe: the name is a validated identifier, so only the caller's variable is read.
         eval "__gpgpw_value=\${$__gpgpw_var:-}"
         if [[ -z "$__gpgpw_value" ]]; then
             printf 'decrypt_env_file: required variable %s is still empty after decrypt.\n' "$__gpgpw_var" >&2
