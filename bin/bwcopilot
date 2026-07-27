@@ -3,8 +3,9 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   - 0.4.0: base functionality
-#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
+# The sandbox environment is supplied via `env -i` and forwarded (bwrap runs
+# without --clearenv), so no --clearenv/--setenv is needed for the env.
 #
 # The sandbox provides filesystem isolation:
 #   - Current directory: read-write

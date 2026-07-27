@@ -36,8 +36,11 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   - 0.4.0: base functionality
-#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
+#
+# The sandbox environment is supplied via `env -i` (see launch_sandbox) and
+# forwarded into the sandbox because bwrap is run WITHOUT --clearenv — so no
+# --clearenv / --setenv machinery is needed for the environment.
 
 # Guard against double-sourcing.
 [[ -n "${_BWRAP_SANDBOX_LIB_SOURCED:-}" ]] && return 0
@@ -91,6 +94,13 @@ BWRAP_ARGS=()
 declare -A _MOUNTED_PREFIXES=()
 _EXTRA_PATH_DIRS=()
 
+# Sandbox environment, as NAME=VALUE strings handed to `env -i` (see
+# launch_sandbox).  bwrap is launched WITHOUT --clearenv, so it forwards this
+# exact set into the sandbox.  Keeping secrets here rather than in BWRAP_ARGS
+# (as --setenv pairs) keeps them out of the resident bwrap's world-readable
+# /proc/<pid>/cmdline — /proc/<pid>/environ is owner-only.
+SANDBOX_ENV=()
+
 # Cached result of `npm prefix -g` (resolved at most once per run).
 # _NPM_PREFIX_RESOLVED flips to 1 after the first lookup; _NPM_PREFIX holds
 # the value (empty string if npm is absent or the lookup failed).
@@ -102,8 +112,6 @@ SANDBOX_PATH=""
 SANDBOX_SHELL=""
 
 # bwrap capability flags (set by detect_bwrap_capabilities)
-HAS_ARGS_FD=0
-HAS_CLEARENV=0
 HAS_BIND_OVER_RO=0
 
 # Kernel capability flags (set by detect_kernel_capabilities)
@@ -158,28 +166,11 @@ _version_ge() {
 # grepping --help.
 #
 # Version history:
-#   0.1.7 - added --args FD (NUL-separated args from an inherited fd)
-#   0.5.0 - added --clearenv
 #   0.6.3 - bind over ro-bind works (can mask binaries inside /usr)
 detect_bwrap_capabilities() {
     local _bwrap_ver
     _bwrap_ver="$(bwrap --version)"
     _bwrap_ver="${_bwrap_ver##* }"            # "bubblewrap 0.11.0" -> "0.11.0"
-
-    # --args FD: Read NUL-separated arguments from an inherited file descriptor
-    # (added in 0.1.7, well before the 0.4.0 floor).  This keeps secrets out of
-    # /proc/<pid>/cmdline: forwarded credentials (API keys, tokens) are placed
-    # on bwrap's argv via --setenv, so a resident bwrap process exposes them to
-    # any local user via `ps auxww` or /proc/<pid>/cmdline.  Passing BWRAP_ARGS
-    # through --args FD instead of argv closes the leak.
-    # Fallback: pass arguments via argv (residual exposure on ancient hosts).
-    HAS_ARGS_FD=0
-    if _version_ge "${_bwrap_ver}" "0.1.7"; then HAS_ARGS_FD=1; fi
-
-    # --clearenv: Start with an empty environment (added in 0.5.0)
-    # Fallback: manually unset all host env vars with --unsetenv
-    HAS_CLEARENV=0
-    if _version_ge "${_bwrap_ver}" "0.5.0"; then HAS_CLEARENV=1; fi
 
     # Bind over ro-bind: ability to bind-mount on top of a read-only bind
     # mount (e.g., masking /usr/bin/ssh after --ro-bind /usr /usr).
@@ -604,13 +595,13 @@ pass_through_if_set() {
     local var_name="$1"
     local var_val="${!var_name:-}"
     if [[ -n "${var_val}" ]]; then
-        BWRAP_ARGS+=(--setenv "${var_name}" "${var_val}")
+        SANDBOX_ENV+=("${var_name}=${var_val}")
     fi
 }
 
 # forward_env_by_prefix PREFIX
 #   Iterate over all exported environment variables whose names start with
-#   PREFIX and append a --setenv entry to BWRAP_ARGS for each one found.
+#   PREFIX and append a NAME=VALUE entry to SANDBOX_ENV for each one found.
 #   Uses the safe `while IFS= read -r` form so variable names containing
 #   unusual characters (e.g. BASH_FUNC_module%%) are handled correctly.
 #
@@ -625,7 +616,7 @@ forward_env_by_prefix() {
     local _key
     while IFS= read -r _key; do
         if [[ "${_key}" == "${_prefix}"* ]]; then
-            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
+            SANDBOX_ENV+=("${_key}=${!_key}")
         fi
     done < <(compgen -e)
 }
@@ -1683,42 +1674,20 @@ build_dynamic_tool_mounts() {
 }
 
 # ── Environment variables ────────────────────────────────────────
-# Start from a clean environment and only pass through what we need.
+# Populate SANDBOX_ENV (NAME=VALUE) with exactly the variables the sandbox
+# should see.  launch_sandbox passes this via `env -i`, so the clean slate is
+# established by env itself — no --clearenv/--unsetenv is needed inside bwrap,
+# which forwards this curated environment into the sandbox.
 build_env_vars() {
-    if [[ "${HAS_CLEARENV}" -eq 1 ]]; then
-        BWRAP_ARGS+=(--clearenv)
-    else
-        # Fallback for bwrap < 0.5.0: manually unset all host env vars.
-        # We use compgen -e to list all exported vars and unset each one.
-        # Note: we already exec with env -i, but --unsetenv ensures any
-        # vars inherited through other means are also cleared.
-        #
-        # Read line-by-line (not `for x in $(...)`) so names are not
-        # word-split on IFS, and skip anything that is not a portable
-        # shell identifier — bash exports function definitions under names
-        # like `BASH_FUNC_module%%`, which would become invalid --unsetenv
-        # arguments.
-        #
-        # On HPC login nodes the exported-var count can reach the hundreds;
-        # each becomes a separate --unsetenv pair, so this path can produce
-        # a long bwrap command line.  That is unavoidable here and harmless
-        # (well under ARG_MAX); the modern --clearenv path above avoids it.
-        local _envvar
-        while IFS= read -r _envvar; do
-            [[ "${_envvar}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-            BWRAP_ARGS+=(--unsetenv "${_envvar}")
-        done < <(compgen -e)
-    fi
-
     # Always set
-    BWRAP_ARGS+=(
-        --setenv HOME "${_HOME}"
-        --setenv USER "${_USER}"
-        --setenv LOGNAME "${_USER}"
-        --setenv SHELL "${SANDBOX_SHELL}"
-        --setenv PATH "${SANDBOX_PATH}"
-        --setenv PWD "${_PWD}"
-        --setenv TERM "${TERM:-xterm-256color}"
+    SANDBOX_ENV+=(
+        "HOME=${_HOME}"
+        "USER=${_USER}"
+        "LOGNAME=${_USER}"
+        "SHELL=${SANDBOX_SHELL}"
+        "PATH=${SANDBOX_PATH}"
+        "PWD=${_PWD}"
+        "TERM=${TERM:-xterm-256color}"
     )
 
     # Terminal
@@ -1855,62 +1824,49 @@ print_dry_run() {
     _ENV_BIN="$(resolve_env_bin)"
 
     # Mirror the exact invocation used by launch_sandbox:
-    #   exec <env_bin> -i <vars> <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
-    # Note: the actual launch passes BWRAP_ARGS via `bwrap --args FD` (NUL-separated
-    # on an inherited fd) to keep secrets out of /proc/<pid>/cmdline; this dry-run
-    # output shows the arguments inline for human readability (with secrets redacted).
+    #   exec <env_bin> -i <SANDBOX_ENV> <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
+    # This is a faithful, pasteable copy of the real launch — with secret values
+    # redacted (see below).  Redaction protects the terminal/scrollback/logs;
+    # it is a separate concern from the runtime leak that env-passing closes
+    # (secrets never reach a resident process's world-readable cmdline).
     printf "exec %s -i \\\\\n" "${_ENV_BIN}"
-    printf "  HOME=%q \\\\\n"    "${_HOME}"
-    printf "  USER=%q \\\\\n"    "${_USER}"
-    printf "  LOGNAME=%q \\\\\n" "${_USER}"
-    printf "  PATH=%q \\\\\n"    "/usr/bin:/bin"
-    printf "  LANG=%q \\\\\n"    "${LANG:-C.UTF-8}"
-    printf "  LC_CTYPE=%q \\\\\n" "${LC_CTYPE:-C.UTF-8}"
+
+    # Sandbox environment: one NAME=VALUE per line.  Split each entry at the
+    # first '=' so the name can be matched against _is_secret_env_var; when it
+    # is sensitive the value is replaced with REDACTED (a literal placeholder,
+    # no quoting needed).  Non-secret values are %q-quoted so entries with
+    # spaces or special characters remain a valid pasteable assignment.
+    local _entry _name _value
+    for _entry in ${SANDBOX_ENV[@]+"${SANDBOX_ENV[@]}"}; do
+        _name="${_entry%%=*}"
+        _value="${_entry#*=}"
+        if _is_secret_env_var "${_name}"; then
+            printf "  %s=REDACTED \\\\\n" "${_name}"
+        else
+            printf "  %s=%q \\\\\n" "${_name}" "${_value}"
+        fi
+    done
     printf "  %s \\\\\n" "${_BWRAP_BIN}"
 
     # Print bwrap arguments one flag-plus-values per line.  Each flag's
     # value count comes from _bwrap_flag_arity, so a value beginning with
     # "--" is grouped with its flag instead of being misread as a new flag.
-    #
-    # For --setenv NAME VALUE pairs where NAME matches a sensitive pattern
-    # (_is_secret_env_var), VALUE is replaced with REDACTED so secrets are
-    # not echoed to the terminal.  The actual launch_sandbox path always
-    # passes the real values.
+    # BWRAP_ARGS carries only mount/namespace configuration (no secrets — the
+    # environment travels via SANDBOX_ENV above), so no redaction is needed here.
     #
     # All values are %q-quoted (bash's shell-quote format) so paths containing
     # single quotes, spaces, or other special characters produce a valid
-    # pasteable shell command.  The REDACTED placeholder for secrets is kept
-    # as a literal string (no quoting needed — it has no special characters).
-    local i=0 arg _arity _j _varname
+    # pasteable shell command.
+    local i=0 arg _arity _j
     while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
         arg="${BWRAP_ARGS[$i]}"
         _arity="$(_bwrap_flag_arity "${arg}")"
         printf "    %q" "${arg}"
         i=$((i + 1))
-        if [[ "${arg}" == "--setenv" && "${_arity}" -eq 2 ]]; then
-            # First value is the variable name — always print it.
-            if [[ $i -lt ${#BWRAP_ARGS[@]} ]]; then
-                _varname="${BWRAP_ARGS[$i]}"
-                printf " %q" "${_varname}"
-                i=$((i + 1))
-            fi
-            # Second value is the variable value — redact if sensitive.
-            if [[ $i -lt ${#BWRAP_ARGS[@]} ]]; then
-                if _is_secret_env_var "${_varname}"; then
-                    # REDACTED is a literal placeholder with no special chars;
-                    # keep it unquoted for readability.
-                    printf " REDACTED"
-                else
-                    printf " %q" "${BWRAP_ARGS[$i]}"
-                fi
-                i=$((i + 1))
-            fi
-        else
-            for ((_j = 0; _j < _arity && i < ${#BWRAP_ARGS[@]}; _j++)); do
-                printf " %q" "${BWRAP_ARGS[$i]}"
-                i=$((i + 1))
-            done
-        fi
+        for ((_j = 0; _j < _arity && i < ${#BWRAP_ARGS[@]}; _j++)); do
+            printf " %q" "${BWRAP_ARGS[$i]}"
+            i=$((i + 1))
+        done
         printf " \\\\\n"
     done
     printf "    --"
@@ -1922,69 +1878,34 @@ print_dry_run() {
     exit 0
 }
 
-# Launch bwrap itself with a scrubbed environment so /proc/1/environ
-# does not leak host variables (SSH_AUTH_SOCK, DBUS_SESSION_BUS_ADDRESS, etc.).
+# Launch bwrap with a curated environment supplied via `env -i`.
 #
 # `env` is resolved via resolve_env_bin (prefers /usr/bin/env) rather than
 # via PATH lookup at exec time — this prevents a user shell script named
 # "env" earlier on PATH from hijacking the launch.  See resolve_env_bin.
 #
-# Security: BWRAP_ARGS is passed via `bwrap --args FD` (NUL-separated args
-# on an inherited fd) rather than argv to keep secrets out of /proc/<pid>/cmdline.
-# Forwarded credentials (ANTHROPIC_FOUNDRY_API_KEY, AIFAPIM_API_KEY, OPENAI_API_KEY,
-# GH_TOKEN*, COPILOT_*, etc.) are placed in BWRAP_ARGS as `--setenv NAME VALUE`,
-# and bwrap stays resident as the session supervisor — so without --args FD,
-# any local user can read the tokens via `ps auxww` for the sandbox's entire
-# lifetime.  The tool command and its arguments stay on the command line (they
-# contain no secrets), only the bwrap configuration moves to the fd.
+# Environment handling: SANDBOX_ENV (NAME=VALUE) is passed on the `env -i`
+# command line.  `env -i` gives bwrap a clean slate containing exactly this set
+# (no host vars like SSH_AUTH_SOCK or DBUS_SESSION_BUS_ADDRESS leak in), and
+# because bwrap runs WITHOUT --clearenv it forwards that same environment into
+# the sandbox — so BWRAP_ARGS carries no --setenv/--clearenv at all.
+#
+# Security: forwarded credentials (ANTHROPIC_FOUNDRY_API_KEY, AIFAPIM_API_KEY,
+# OPENAI_API_KEY, GH_TOKEN*, COPILOT_*, etc.) travel in the environment, not on
+# bwrap's argv.  /proc/<pid>/environ is readable only by the process owner,
+# whereas /proc/<pid>/cmdline is world-readable — so a resident bwrap no longer
+# exposes secrets to other local users via `ps auxww`.  The values do appear
+# briefly on `env`'s own argv, but `env` execs bwrap immediately and is never
+# resident, so the exposure window is a scheduling instant rather than the
+# sandbox's whole lifetime.  The tool command and its arguments stay on argv
+# (they contain no secrets).
 launch_sandbox() {
     local _BWRAP_BIN _ENV_BIN
     _BWRAP_BIN="$(command -v bwrap)"
     _ENV_BIN="$(resolve_env_bin)"
 
-    if [[ "${HAS_ARGS_FD}" -eq 1 ]]; then
-        # Modern path: stage BWRAP_ARGS in a temporary file (mode 0600), open it
-        # as an fd, unlink the path immediately (data stays alive via the open fd),
-        # then pass the fd to bwrap via --args.  This keeps secrets out of
-        # /proc/<pid>/cmdline.
-        local _args_fd _staged_args _arg _old_umask
-        # Create a 0600 temp file (mktemp creates mode 0600 by default, but we
-        # set umask 077 to be explicit and defend against any mktemp that might
-        # honor a permissive umask).  Save and restore the umask to avoid
-        # side effects.
-        _old_umask="$(umask)"
-        umask 077
-        _staged_args="$(mktemp --tmpdir bwrap-args.XXXXXX)"
-        umask "${_old_umask}"
-        # Write each BWRAP_ARGS element as a NUL-separated record.
-        for _arg in ${BWRAP_ARGS[@]+"${BWRAP_ARGS[@]}"}; do
-            printf '%s\0' "${_arg}"
-        done > "${_staged_args}"
-        # Open the file read-only as an fd, then immediately unlink it.
-        # The kernel keeps the data alive via the open fd; the filename
-        # disappears from /tmp so there is nothing to clean up on exit or signal.
-        exec {_args_fd}< "${_staged_args}"
-        rm -f "${_staged_args}"
-        # Launch bwrap with --args FD; the tool command stays on argv.
-        exec "${_ENV_BIN}" -i \
-            HOME="${_HOME}" \
-            USER="${_USER}" \
-            LOGNAME="${_USER}" \
-            PATH="/usr/bin:/bin" \
-            LANG="${LANG:-C.UTF-8}" \
-            LC_CTYPE="${LC_CTYPE:-C.UTF-8}" \
-            "${_BWRAP_BIN}" --args "${_args_fd}" -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}
-    else
-        # Fallback for bwrap < 0.1.7 (well below the 0.4.0 floor, extremely unlikely):
-        # pass BWRAP_ARGS via argv.  This exposes secrets in /proc/<pid>/cmdline for
-        # the sandbox's entire lifetime — any local user can read them via ps.
-        exec "${_ENV_BIN}" -i \
-            HOME="${_HOME}" \
-            USER="${_USER}" \
-            LOGNAME="${_USER}" \
-            PATH="/usr/bin:/bin" \
-            LANG="${LANG:-C.UTF-8}" \
-            LC_CTYPE="${LC_CTYPE:-C.UTF-8}" \
-            "${_BWRAP_BIN}" "${BWRAP_ARGS[@]}" -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}
-    fi
+    exec "${_ENV_BIN}" -i \
+        ${SANDBOX_ENV[@]+"${SANDBOX_ENV[@]}"} \
+        "${_BWRAP_BIN}" ${BWRAP_ARGS[@]+"${BWRAP_ARGS[@]}"} \
+        -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}
 }
