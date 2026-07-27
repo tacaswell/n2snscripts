@@ -109,9 +109,15 @@ HAS_BIND_OVER_RO=0
 # Kernel capability flags (set by detect_kernel_capabilities)
 KERNEL_HAS_TIOCSTI_CAP_GUARD=0
 
-# Git include tracking (used by parse_git_includes)
+# Git include tracking (used by parse_git_includes).  Parallel arrays:
+# GIT_INCLUDE_PATHS holds the logical include paths (what git opens, and
+# therefore the bind DESTINATION); GIT_INCLUDE_TARGETS holds each path's
+# canonical resolution (the bind SOURCE).  They differ when an include is a
+# symlink or sits under a symlinked directory (e.g. dotfiles-managed
+# ~/.git_work_config -> ~/.dotfiles/git/...).
 declare -A _GIT_INCLUDE_SEEN=()
 GIT_INCLUDE_PATHS=()
+GIT_INCLUDE_TARGETS=()
 
 # Working directory state (set by build_workdir_mount)
 _BIND_DIR=""
@@ -468,15 +474,14 @@ parse_git_includes() {
     # arbitrary path — or hard-exit build_git_mounts if that path lands in a
     # blocked prefix (e.g. a legal difftool.path).
     #
-    # LIMITATION: [includeIf "<cond>"] conditional includes are intentionally
-    # NOT honored.  Correctly evaluating gitdir/onbranch/hasconfig conditions
-    # with git's glob semantics is out of scope for this pure-bash parser, and
-    # the target repository is not even known at this point (build_workdir_mount
-    # runs later).  Rather than over-mount an include whose condition may not
-    # apply — which could also trip the blocked-path guard on otherwise-legal
-    # config — conditional includes are skipped.  Git silently ignores a missing
-    # include, so the tool still runs; only the conditionally-included settings
-    # are absent inside the sandbox.
+    # [includeIf "<cond>"] conditional includes: the referenced files are
+    # mounted unconditionally without evaluating the condition here.  Git inside
+    # the sandbox sees the real gitdir (the repo is bind-mounted at the same
+    # path), so it evaluates conditions correctly at runtime and silently skips
+    # files whose condition does not match.  Implementing gitdir/onbranch/
+    # hasconfig glob semantics in pure bash would be complex and fragile;
+    # mounting a superset is safe because every file still passes the same
+    # _check_path_safe guard as plain [include] files.
     local line _section _section_name path_val
     local in_include=0
     while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -488,7 +493,7 @@ parse_git_includes() {
             # section names are case-insensitive.
             _section_name="${_section%%[[:space:]]*}"
             _section_name="${_section_name,,}"
-            if [[ "${_section_name}" == "include" ]]; then
+            if [[ "${_section_name}" == "include" || "${_section_name}" == "includeif" ]]; then
                 in_include=1
             else
                 in_include=0
@@ -564,18 +569,21 @@ parse_git_includes() {
             path_val="${config_dir}/${path_val}"
         fi
 
-        # Resolve symlinks and canonicalize
+        # Canonicalize for the bind SOURCE.  readlink -f resolves the file
+        # itself AND any symlinked ancestor directories (a dotfiles-managed
+        # include like ~/.git_work_config -> ~/.dotfiles/git/... is the common
+        # case).  The LOGICAL path stays the bind DESTINATION: git opens the
+        # include at the path written in the config, and inside the tmpfs
+        # $HOME the host's symlink does not exist — binding at the canonical
+        # path would leave the logical path dangling.
         local resolved
-        if [[ -L "${path_val}" ]]; then
-            resolved="$(readlink -f "${path_val}" 2> /dev/null || echo "${path_val}")"
-        else
-            resolved="${path_val}"
-        fi
+        resolved="$(readlink -f "${path_val}" 2> /dev/null || echo "${path_val}")"
 
-        # Deduplicate
-        if [[ -e "${resolved}" ]] && [[ -z "${_GIT_INCLUDE_SEEN["${resolved}"]:-}" ]]; then
-            _GIT_INCLUDE_SEEN["${resolved}"]=1
-            GIT_INCLUDE_PATHS+=("${resolved}")
+        # Deduplicate on the logical path (the mount destination).
+        if [[ -e "${resolved}" ]] && [[ -z "${_GIT_INCLUDE_SEEN["${path_val}"]:-}" ]]; then
+            _GIT_INCLUDE_SEEN["${path_val}"]=1
+            GIT_INCLUDE_PATHS+=("${path_val}")
+            GIT_INCLUDE_TARGETS+=("${resolved}")
         fi
     done < "${config_file}"
 }
@@ -1553,21 +1561,27 @@ build_git_mounts() {
         BWRAP_ARGS+=(--ro-bind "${XDG_CONFIG_HOME}/git" "${XDG_CONFIG_HOME}/git")
     fi
 
-    # Git include files (read-only).
-    # parse_git_includes already resolved symlinks in include paths via
-    # readlink -f.  Check each resolved include path before mounting —
-    # a git config could contain  path = ~/.ssh/id_rsa  or similar.
+    # Git include files (read-only).  Bind each file's canonical target
+    # (GIT_INCLUDE_TARGETS, symlink-chased by parse_git_includes) at its
+    # LOGICAL path (GIT_INCLUDE_PATHS) — the path written in the config is
+    # what git opens, and the host's symlink chain does not exist inside the
+    # tmpfs $HOME.  Same source-at-logical-destination treatment as
+    # ~/.gitconfig above.  Safety is checked on the canonical target — that
+    # is the data actually exposed; a git config could contain
+    # path = ~/.ssh/id_rsa or similar.
     declare -A _GIT_INC_DIRS_SEEN=()
-    local inc_path local_parent
-    for inc_path in "${GIT_INCLUDE_PATHS[@]+"${GIT_INCLUDE_PATHS[@]}"}"; do
-        _check_path_safe "${inc_path}" "git include path"
+    local _inc_i inc_path inc_target local_parent
+    for ((_inc_i = 0; _inc_i < ${#GIT_INCLUDE_PATHS[@]}; _inc_i++)); do
+        inc_path="${GIT_INCLUDE_PATHS[${_inc_i}]}"
+        inc_target="${GIT_INCLUDE_TARGETS[${_inc_i}]}"
+        _check_path_safe "${inc_target}" "git include path"
         # Ensure parent directory exists as a mount point (deduplicated)
         local_parent="${inc_path%/*}"
         if [[ -z "${_GIT_INC_DIRS_SEEN["${local_parent}"]:-}" ]]; then
             _GIT_INC_DIRS_SEEN["${local_parent}"]=1
             BWRAP_ARGS+=(--dir "${local_parent}")
         fi
-        BWRAP_ARGS+=(--ro-bind-try "${inc_path}" "${inc_path}")
+        BWRAP_ARGS+=(--ro-bind-try "${inc_target}" "${inc_path}")
     done
 }
 
