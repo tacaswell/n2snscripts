@@ -122,8 +122,8 @@ gh-protect-branch --only-restrict-creation \
 
 ## Caveats
 
-- Requires `gh(1)` authenticated with `admin:repo` scope on the target
-  repository. The `--approvers` preflight check also requires `read:org`
+- Requires `jq(1)` (used to build the JSON request payloads) and `gh(1)`
+  authenticated with `admin:repo` scope on the target repository. The `--approvers` preflight check also requires `read:org`
   scope (GitHub team API requirement); a 404 may mean the team does not
   exist **or** that the token lacks `read:org`.
 - Secret scanning requires the repository to belong to an organization on
