@@ -55,10 +55,30 @@ def answer(q):
     return q[:2] + struct.pack("!HHHHH", 0x8180, 1, 2, 0, 0) + q[12:end] + rr1 + rr2
 
 
+def as_relay_queries(lines):
+    """The fixture's UDP lookups to 169.254.1.1:53 come from ephemeral ports
+    (it was captured before the relay used fixed ones); give them a relay
+    source port, so they are the relay's own legs."""
+    return [
+        re.sub(r"(\(TGT\):\s+TAP \[[^\]]*\]:)\d+( -> \[169\.254\.1\.1\]:53 )", r"\g<1>1000\2", line) for line in lines
+    ]
+
+
+def udp_flow(idx, src_port, dst="[169.254.1.1]:53", t="1.0000"):
+    p = "%s:          Flow %d " % (t, idx)
+    return [
+        p + "(NEW): FREE -> NEW",
+        p + "(TGT):     TAP [198.51.100.7]:%d -> %s => HOST [0.0.0.0]:%d -> %s" % (src_port, dst, src_port, dst),
+        p + "(UDP flow): TGT -> TYPED",
+        p + "(UDP flow): TYPED -> ACTIVE",
+        "2.0000:          Flow %d (FREE): ACTIVE -> FREE" % idx,
+    ]
+
+
 class CondenserTest(unittest.TestCase):
     def setUp(self):
         with open(FIXTURE) as f:
-            self.raw = f.read().splitlines()
+            self.raw = as_relay_queries(f.read().splitlines())
         self.out = condense(self.raw)
 
     def flows(self, event):
@@ -91,8 +111,33 @@ class CondenserTest(unittest.TestCase):
         for noise in ("Template interface", "timer expires", "STALLED", "ACK_FROM_TAP_DUE", "hash table"):
             self.assertNotIn(noise, text)
 
-    def test_dns_forward_flows_dropped(self):
+    def test_relay_queries_dropped(self):
         self.assertFalse(any("169.254.1.1:53" in x for x in self.out))
+
+    def test_relay_query_from_a_relay_port_is_not_logged(self):
+        for port in (netlog.RELAY_UDP_PORTS[0], netlog.RELAY_UDP_PORTS[-1]):
+            self.assertEqual(condense(udp_flow(5, port)), [])
+
+    def test_lookup_around_the_relay_is_logged(self):
+        # Sent straight to the DNS address, from a port the relay never uses.
+        out = condense(udp_flow(5, 41000))
+        self.assertEqual(
+            out,
+            [
+                "flow=5 open proto=udp dir=out src=198.51.100.7:41000 dst=169.254.1.1:53 bypass=dns t=1.000",
+                "flow=5 close proto=udp dir=out dst=169.254.1.1:53 bypass=dns t=2.000 secs=1.000",
+            ],
+        )
+
+    def test_privileged_port_outside_the_relay_set_is_logged(self):
+        out = condense(udp_flow(5, 53))
+        self.assertEqual(len(out), 2)
+        self.assertIn("bypass=dns", out[0])
+
+    def test_other_dns_servers_are_ordinary_connections(self):
+        out = condense(udp_flow(5, 41000, dst="[192.0.2.53]:53"))
+        self.assertEqual(len(out), 2)
+        self.assertNotIn("bypass", out[0])
 
     def test_only_flows_and_dns(self):
         for line in self.out:
@@ -504,6 +549,7 @@ class DnsRelayTest(unittest.TestCase):
         self.up_tcp.listen()
         self.up_tcp.settimeout(0.2)
         self.up_tcp_answers = True
+        self.up_seen = []  # source ports of the UDP queries upstream
         self.up_udp_thread = threading.Thread(target=self._serve_udp)
         self.up_tcp_thread = threading.Thread(target=self._serve_tcp)
         self.up_udp_thread.start()
@@ -532,6 +578,7 @@ class DnsRelayTest(unittest.TestCase):
         while not self.stop.is_set():
             try:
                 q, a = self.up_udp.recvfrom(4096)
+                self.up_seen.append(a[1])
                 self.up_udp.sendto(answer(q), a)
             except socket.timeout:
                 continue
@@ -663,6 +710,60 @@ class DnsRelayTest(unittest.TestCase):
             gate.set()
             relay.close()
             serve_thread.join(timeout=3)
+
+
+def free_udp_ports(n):
+    """N UDP ports free on 127.0.0.1 now (unprivileged stand-ins for
+    RELAY_UDP_PORTS, which only a process with CAP_NET_BIND_SERVICE gets)."""
+    socks = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(n)]
+    try:
+        for s in socks:
+            s.bind(("127.0.0.1", 0))
+        return tuple(s.getsockname()[1] for s in socks)
+    finally:
+        for s in socks:
+            s.close()
+
+
+class DnsRelaySourcesTest(DnsRelayTest):
+    """Every DnsRelayTest case again, querying from the fixed source ports."""
+
+    def _open(self, relay):
+        relay.src_ports = free_udp_ports(4)
+        relay.bind()
+        self.assertIsNotNone(relay.sources, "the source ports could not be bound")
+
+    def test_queries_come_from_the_source_ports(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as c:
+            c.settimeout(3)
+            for _ in range(3):
+                c.sendto(query("www.example.org"), self.addr)
+                c.recv(4096)
+        self.assertTrue(self.up_seen)
+        self.assertTrue(set(self.up_seen) <= set(self.relay.src_ports), (self.up_seen, self.relay.src_ports))
+
+    def test_a_late_answer_is_not_taken_for_the_next(self):
+        # A stale answer (another ID) waiting on the socket is dropped.
+        s = self.relay.sources.get()
+        self.relay.sources.put(s)
+        port = s.getsockname()[1]
+        stale = answer(query("stale.example.org", tid=0x0101))
+        self.up_udp.sendto(stale, ("127.0.0.1", port))
+        time.sleep(0.1)
+        for _ in range(len(self.relay.src_ports)):
+            r = self.relay._ask_udp(query("www.example.org", tid=0x0202))
+            self.assertEqual(r[:2], b"\x02\x02")
+
+    def test_without_the_ports_the_relay_still_works(self):
+        relay = netlog.DnsRelay("127.0.0.1:0", "%s:%d" % self.relay.upstream, io.StringIO(), src_ports=(1,))
+        try:
+            relay.bind()  # port 1 needs CAP_NET_BIND_SERVICE, which a test does not have
+            if relay.sources is not None:
+                self.skipTest("running with CAP_NET_BIND_SERVICE")
+            r = relay._ask_udp(query("www.example.org"))
+            self.assertEqual(netlog.parse_answers(r)[0], "NOERROR")
+        finally:
+            relay.close()
 
 
 class DnsRelayAdoptTest(DnsRelayTest):

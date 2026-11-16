@@ -33,6 +33,13 @@ can be attributed without looking up the session's start record:
     session=ID user=NAME flow=9 fail proto=tcp dir=out dst=192.0.2.1:443 src=... t=40.120
     session=ID user=NAME dns domain=github.com type=A rcode=NOERROR answers=140.82.113.22
     session=ID user=NAME dns domain=api.x.com type=A rcode=NOERROR answers=192.0.2.1 cname=lb.x.net
+    session=ID user=NAME flow=12 open proto=udp dir=out src=...:41000 dst=169.254.1.1:53 bypass=dns t=50.002
+
+The relay's own UDP queries to the backend's DNS address are not logged as
+connections: its `dns` line already says what was asked.  They are told apart
+by their source port, one of RELAY_UDP_PORTS, which only the relay can hold
+(see DnsRelay.bind_sources).  A UDP lookup sent to that address from any other
+port went around the relay and is logged as a connection with bypass=dns.
 """
 
 # Kept to what the DNS relay needs: it starts while the sandbox starts, and
@@ -42,6 +49,7 @@ import ctypes
 import ipaddress
 from concurrent.futures import ThreadPoolExecutor
 import os
+import queue
 import re
 import signal
 import socket
@@ -49,6 +57,14 @@ import struct
 import sys
 import threading
 import time
+
+# Source ports of the DNS relay's UDP queries to the backend's DNS address,
+# one per worker.  Privileged ports: the relay binds them while it still has
+# CAP_NET_BIND_SERVICE in the namespace and holds them for the session, and
+# nothing in the sandbox can bind a port below 1024 there (nor share one the
+# relay holds without SO_REUSEADDR).  Ports below 1024 are free in the
+# namespace: --publish and --host-port take 1024-65535 only.
+RELAY_UDP_PORTS = tuple(range(1000, 1016))
 
 # ── condense ────────────────────────────────────────────────────────────
 
@@ -98,9 +114,10 @@ def record_prefix(session, user):
 class Condenser:
     """Turn pasta debug lines into open and close lines, one pair per flow."""
 
-    def __init__(self, emit, dns_forward="169.254.1.1"):
+    def __init__(self, emit, dns_forward="169.254.1.1", relay_ports=RELAY_UDP_PORTS):
         self.emit = emit
         self.dns_forward = dns_forward
+        self.relay_ports = frozenset(str(p) for p in relay_ports)
         self.flows = {}
         self.names = {}
         self.last_t = 0.0
@@ -155,7 +172,7 @@ class Condenser:
                 del self.flows[idx]
                 if f.get("open"):
                     self._close(idx, f, t)
-                elif "ini" in f and not self._is_dns_forward(f):
+                elif "ini" in f and not self._is_relay_query(f):
                     # Never became active: a refused or failed connection.
                     self.emit(" ".join(self._fields(idx, f, "fail") + ["src=%s" % _hostport(*f["src"]), "t=%.3f" % t]))
             return
@@ -178,20 +195,26 @@ class Condenser:
         name = self.names.get(f["dst"][0])
         if name and direction == "out":
             parts.append("domain=%s" % _value(name))
+        if self._is_dns_forward(f):
+            parts.append("bypass=dns")
         return parts
 
     def _is_dns_forward(self, f):
-        # pasta's own leg of a lookup the relay already logged as a dns line.
         return f.get("proto") == "udp" and f["dst"] == (self.dns_forward, "53")
+
+    def _is_relay_query(self, f):
+        # The relay's own leg of a lookup it already logged as a dns line.
+        # Any other UDP lookup to the DNS address went around the relay.
+        return self._is_dns_forward(f) and f["src"][1] in self.relay_ports
 
     def _open(self, idx, f, t):
         f["open"] = True
-        if self._is_dns_forward(f):
+        if self._is_relay_query(f):
             return
         self.emit(" ".join(self._fields(idx, f, "open") + ["t=%.3f" % t]))
 
     def _close(self, idx, f, t, reason=None):
-        if self._is_dns_forward(f):
+        if self._is_relay_query(f):
             return
         parts = self._fields(idx, f, "close") + ["t=%.3f" % t, "secs=%.3f" % (t - f["t0"])]
         if reason:
@@ -663,14 +686,17 @@ def _addr(spec, port=53):
 
 
 class DnsRelay:
-    def __init__(self, listen, upstream, out=None, workers=16, pending=32):
+    def __init__(self, listen, upstream, out=None, workers=None, pending=32, src_ports=RELAY_UDP_PORTS):
         self.listen = _addr(listen)
         self.upstream = _addr(upstream)
         self.out = out or sys.stdout
         self.lock = threading.Lock()
+        workers = workers or len(src_ports) or 16
         self.slots = threading.BoundedSemaphore(workers + pending)
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bwrap-dns")
         self.stopping = threading.Event()
+        self.src_ports = src_ports
+        self.sources = None  # a queue of UDP sockets on src_ports, see bind_sources
 
     def _submit(self, fn, *args):
         if not self.slots.acquire(False):
@@ -689,6 +715,72 @@ class DnsRelay:
             if sock is not None:
                 sock.close()
         self.pool.shutdown(wait=True)
+        while self.sources is not None and not self.sources.empty():
+            self.sources.get().close()
+
+    def bind_sources(self):
+        """Bind one UDP socket per source port and connect it upstream.
+
+        Needs CAP_NET_BIND_SERVICE for the default (privileged) ports, so it
+        runs before the capabilities are dropped.  When a port cannot be had
+        (slirp4netns, where the relay has no capabilities; tests) the relay
+        queries from ephemeral ports instead: then the condenser logs its
+        queries as connections with bypass=dns, too many rather than too few.
+        """
+        socks = []
+        try:
+            for port in self.src_ports:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                socks.append(s)
+                s.bind(("0.0.0.0", port))
+                s.connect(self.upstream)
+        except OSError:
+            for s in socks:
+                s.close()
+            return False
+        self.sources = queue.Queue()
+        for s in socks:
+            self.sources.put(s)
+        return True
+
+    def _ask_udp(self, query):
+        """Send QUERY upstream and return the response, None if there is none."""
+        if self.sources is None:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.settimeout(5)
+                    s.connect(self.upstream)
+                    s.send(query)
+                    return s.recv(65535)
+            except OSError:
+                return None
+        s = self.sources.get()
+        try:
+            # The socket is reused: drop what is left from an earlier query
+            # that timed out, then accept only the response with this ID.
+            s.setblocking(False)
+            while True:
+                try:
+                    s.recv(65535)
+                except (BlockingIOError, InterruptedError):
+                    break
+                except OSError:
+                    continue  # a pending error (port unreachable) is cleared by reading it
+            s.setblocking(True)
+            s.send(query)
+            deadline = time.monotonic() + 5
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                s.settimeout(left)
+                response = s.recv(65535)
+                if response[:2] == query[:2]:
+                    return response
+        except OSError:
+            return None
+        finally:
+            self.sources.put(s)
 
     def log(self, query, response, proto):
         try:
@@ -726,15 +818,7 @@ class DnsRelay:
                 pass
 
     def _udp_one(self, srv, query, client):
-        response = None
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.settimeout(5)
-                s.connect(self.upstream)
-                s.send(query)
-                response = s.recv(65535)
-        except OSError:
-            pass
+        response = self._ask_udp(query)
         # Log before answering: the client connects as soon as it has the
         # answer, and the condenser must know the name by then.
         self.log(query, response, "udp")
@@ -811,6 +895,7 @@ class DnsRelay:
         # Port zero is useful for isolated tests; TCP must share UDP's port.
         self.tcp.bind(self.udp.getsockname())
         self.tcp.listen(16)
+        self.bind_sources()
 
     def adopt(self, udp_fd, tcp_fd):
         """Take over sockets bound before the exec that dropped our privileges.
@@ -821,7 +906,8 @@ class DnsRelay:
         the exec chain the relay holds no capabilities (seen: CapEff 0, the
         bind refused), so the process that creates the namespace binds the
         sockets and hands them over here (see _NET_NS_IDENTITY in
-        bwrap_sandbox_lib.sh).
+        bwrap_sandbox_lib.sh).  The relay then queries from ephemeral ports
+        (no bind_sources): slirp4netns has no flow log to keep them out of.
         """
         self.udp = socket.fromfd(udp_fd, socket.AF_INET, socket.SOCK_DGRAM)
         self.tcp = socket.fromfd(tcp_fd, socket.AF_INET, socket.SOCK_STREAM)
