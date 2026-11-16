@@ -27,8 +27,9 @@ option list; the tables below summarise the common surface.
   used to find busy ports for `--publish`.
 - For the [network log](#network-log): `systemd-cat` (systemd) with a running
   journal, or `logger` (util-linux) with `/dev/log`. Without either the
-  wrappers warn and run without the log. Python 3.6+ (standard library) to
-  condense it and to name destinations (DNS relay).
+  wrappers warn and run without the log. With one, a private network also
+  needs Python 3.6+ (standard library) to condense the log and to name
+  destinations (DNS relay); without it the wrappers stop (exit 3).
 
 ## Managed system paths
 
@@ -437,6 +438,8 @@ change them, and they are the data needed for a later egress allowlist.
 | close | `session=ID user=NAME flow=7 close proto=tcp dir=out dst=140.82.112.21:443 domain=github.com t=33.770 secs=12.411` |
 | fail | `session=ID user=NAME flow=9 fail ...`: a connection that never became active (refused, unreachable) |
 | end | `event=end session=ID ...`, when the sandbox has exited |
+| abort | `event=abort session=ID launcher=... user=NAME reason=...`: the launch stopped after the start record because the log could not run (`no-python`, `helper-missing`, `condenser-failed`) |
+| error | `session=ID user=NAME condense level=error msg=REASON action=end-session`: the session was ended because its log stopped (`dns-relay-stopped`, `log-tool-stopped`, `log-tool-stalled`, `watch-failed`) |
 
 Every line is `key=value` (logfmt), so a log store's logfmt parser can filter
 on any field. Every record after the start names both the session and the
@@ -458,6 +461,11 @@ records.
   returned the destination address. It is a record, not proof: several
   domains can share one address (CDNs), and a lookup that bypasses the relay
   (a query sent to `169.254.1.1` directly, DNS over HTTPS) leaves none.
+- `bypass=dns` marks a UDP connection to `169.254.1.1:53` that did not come
+  from the relay: a lookup sent around it, whose name is not logged (see
+  "DNS relay" below). With pasta such a lookup is always logged
+  as a connection; with slirp4netns, which has no flow log, it is not logged
+  at all.
 
 - **Tag** (`SYSLOG_IDENTIFIER`): `bwrap-net`. `journalctl -t bwrap-net` shows
   all sessions; `journalctl -t bwrap-net -g ID` one. Inside the sandbox
@@ -478,10 +486,33 @@ records.
   without the log.
 - **Flows only with pasta; DNS with either.** slirp4netns has no flow log, so
   with it the records are the start, the end and the DNS relay's lookups —
-  which are then the only account of what the sandbox reached for. With
+  which are then the only account of what the sandbox reached for. It cannot
+  show anything that goes around the relay: a query sent straight to
+  slirp4netns's DNS address or to any other server, DNS over HTTPS, or a
+  connection to an address the sandbox already knows. With
   `--share-net` (recorded as `backend=none`) there is no namespace to relay
   in, so only the start and end records are written. The start record says
   which is which: `flows=logged|unavailable dns=logged|unavailable`.
+- **Not optional in a private network.** Once a log tool works, a session in
+  a private network does not run without its log:
+  - The launch stops (exit 3, an `abort` record) without Python 3.6 or later
+    or `lib/bwrap_netlog.py`, or when the reader does not say it is ready
+    within 10 seconds. `--share-net` needs neither (it logs only the start and
+    end).
+  - bwrap is not started (the descriptor relay exits 126) when the DNS relay
+    does not say it is listening within 10 seconds; the reason is printed,
+    prefixed `pasta:` or `slirp4netns:`.
+  - A running session is ended when its log stops: the reader ends it when
+    the DNS relay goes away or the tool exits or does not take a record for
+    30 seconds, and a small holder process (`_net_hold_run`, the one that
+    holds the database lock, see [Database guard](#database-guard)) ends it
+    when the reader goes away, even if the reader was killed outright. Each watches a pipe or FIFO
+    that only the other holds open, so end of file means it is gone. Ending
+    the session means SIGTERM, then SIGKILL after 3 seconds, to the launcher
+    process: pasta, whose child bwrap dies with it through
+    `--die-with-parent`, or bwrap itself with slirp4netns. The record says
+    why at once, and an `Error: ...; the session was ended` line on your
+    terminal says why once the launcher has gone.
 - When the launcher runs on a terminal it prints the tool and the session ID.
 - **How (pasta).** pasta logs flows only at debug level, and at debug level it
   never uses syslog: without `--log-file` it writes every line, timestamped,
@@ -504,17 +535,16 @@ records.
     and stops only when the launcher process, which is pasta by then, is
     gone (it is no longer the reader's parent), after draining the pipe. Then
     it writes the end record and removes the session directory.
-  - With Python, if the tool dies, or stays alive but stops reading, the
-    reader goes on reading and drops the lines, so pasta never blocks on it.
-    Lines wait in memory, up to 8 MiB, for a writer thread (which writes what
-    is waiting in one go); when that is full they are dropped (a tool that is
-    only slow, behind a burst larger than that, loses lines too), and the next
-    line that is queued carries a
-    `condense level=warn msg=log-tool-behind dropped=N` note in front of it. At the end the end record and the queue get 5 seconds in all, and
-    the tool 5 more to exit, before it is killed; if it was not reading, the
-    reader says on its stderr how many records were lost. Without Python the
-    bash supervisor writes synchronously, and a tool that stops reading stalls
-    it.
+  - The reader never blocks pasta on the tool. Lines wait in memory, up to
+    8 MiB, for a writer thread (which writes what is waiting in one go); when
+    that is full they are dropped (a tool that is only slow, behind a burst
+    larger than that, loses lines too), and the next line that is queued
+    carries a `condense level=warn msg=log-tool-behind dropped=N` note in
+    front of it. A tool that exits, or whose write does not finish within 30
+    seconds, ends the session (see above). At the end the end record and the
+    queue get 5 seconds in all, and the tool 5 more to exit, before it is
+    killed; if it was not reading, the reader says on its stderr how many
+    records were lost.
   - pasta prints its setup first, and if it fails to start, its error. The
     descriptor relay (pasta's command) prints a marker on the FIFO and reopens
     your stderr: by path when it is a terminal or a file, else (a pipe)
@@ -530,8 +560,6 @@ records.
     the rest (in a real session, 5000 lines became 280). It writes to
     `systemd-cat` / `logger` itself. pasta's version is in the start record
     (`pasta=`), from `pasta --version`.
-  - Without Python a bash supervisor copies pasta's lines to the log as they
-    are.
 - **DNS relay (both backends).** To name destinations, `lib/bwrap_netlog.py dns`
   listens on `127.53.0.1:53` (UDP and TCP) in the sandbox's network namespace,
   forwards each lookup to the backend's DNS (`169.254.1.1`, pasta's DNS
@@ -542,8 +570,17 @@ records.
   [Implementation notes: slirp4netns](#implementation-notes-slirp4netns). The condenser keeps a map from the answers'
   addresses to domains. The sandbox's `/etc/resolv.conf` lists the relay first
   and `169.254.1.1` second, so lookups go on working, at once, if the relay is
-  down (its port is then closed); pasta's own leg of a relayed lookup (UDP to
-  `169.254.1.1:53`) is not logged as a connection.
+  overloaded; such a lookup then shows as a `bypass=dns` connection.
+  - **The relay's own queries are not logged twice.** With pasta the relay
+    sends its UDP queries to `169.254.1.1:53` from source ports 1000-1015,
+    bound while it may still bind ports below 1024 and held for the whole
+    session; nothing in the sandbox can bind those ports. The reader leaves
+    out connections from these ports only (the relay's `dns` line already
+    says what was asked) and logs every other UDP lookup to `169.254.1.1:53`
+    with `bypass=dns`, so a query sent there directly cannot avoid the log.
+    The relay's TCP queries come from ordinary ports and are logged as
+    connections. With slirp4netns the relay cannot bind those ports, and there
+    is no flow log to keep its queries out of.
   - The relay limits itself to 16 workers and 32 queued requests. On overload,
     a UDP query gets a logged `SERVFAIL` (allowing the client's next resolver
     to answer); a new TCP connection is closed. Each TCP query uses its own
@@ -553,12 +590,15 @@ records.
     It runs outside bwrap: the agent cannot see it (separate process
     namespace), and cannot take its port (it has no capabilities).
   - The descriptor relay waits until it listens (it says so on a pipe) before
-    starting bwrap, at most 0.25 s, so the first lookups are logged too. In
-    practice that is a Python start, some tens of milliseconds.
-  - It exits when bwrap does.
+    starting bwrap, so the first lookups are logged too, and stops if it has
+    not after 10 seconds. In practice that is a Python start, some tens of
+    milliseconds.
+  - It holds a FIFO in the session directory open for the reader; when that
+    closes while the session is still running, the reader ends the session.
+    It exits when bwrap does.
 - Both need Python 3.6 or later, standard library only (RHEL 8's
-  `/usr/libexec/platform-python`, else `python3`). Without it pasta's lines go
-  to the log unfiltered, and DNS goes straight to `169.254.1.1`.
+  `/usr/libexec/platform-python`, else `python3`). Without it a launch in a
+  private network stops (see above).
 
 ### Reading the network log
 
@@ -1057,7 +1097,10 @@ host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
   has gone. The holder runs on the host, ignores the signals meant for the
   session, closes every other descriptor it inherited, waits with
   `/usr/bin/sleep` (not one found through `PATH`) and does not depend on a log
-  tool working. It holds the lock next to OpenCode, not inside it. If someone
+  tool working. The same process ends the session if the
+  [network log](#network-log)'s reader goes away, so it runs in every private
+  network session, and without `/usr/bin/sleep` or `/bin/sleep` the launch
+  stops. It holds the lock next to OpenCode, not inside it. If someone
   kills the holder the lock is released while OpenCode runs, and the holder
   watches the launcher, not the sandbox: if the launcher is killed first,
   the lock goes at once, while `bwrap --die-with-parent` ends the sandbox

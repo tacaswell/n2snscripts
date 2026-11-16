@@ -78,7 +78,10 @@ Add those three exports to your `~/.bashrc` or `~/.zshrc` for persistence.
   `--share-net`
 - `systemd-cat` (with a running journal) or `logger`, for the `bw*` wrappers'
   always-on network log (tag `bwrap-net`); without either they warn and run
-  without it
+  without it. With one, a private network also needs `python3 >= 3.6`
+  (stdlib only, or RHEL 8's `/usr/libexec/platform-python`) for the log's
+  condenser and DNS relay: without it they stop, and a session whose log
+  stops is ended
 - `gpg(1)` for `gpg-passwd.sh`
 - `openssl(1)` for `pemdecompose`
 - `python3 >= 3.9` (stdlib only, no pip dependencies) for `azoidcapp`
