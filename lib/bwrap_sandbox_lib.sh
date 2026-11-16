@@ -2642,7 +2642,17 @@ _net_session_dir() {
 #     not lost.
 #   - The log is not optional in a private network: without Python 3.6 (or
 #     the helper), or when the condenser does not start, the launch stops
-#     (_net_log_abort) instead of running unlogged.
+#     (_net_log_abort) instead of running unlogged; when the DNS relay does
+#     not start, the descriptor relay stops before bwrap.  A session whose
+#     log stops is ended (SIGTERM, then SIGKILL, to the launcher process,
+#     pasta or bwrap; bwrap's --die-with-parent takes the sandbox with it):
+#       condenser exits         the keeper (_net_hold_run) sees end of file
+#                               on the pipe only the condenser writes
+#       DNS relay exits         the condenser sees end of file on the
+#                               lifeline FIFO only the relay writes
+#       log tool exits, or a    the condenser (SessionEnder in
+#       write to it stalls 30 s bwrap_netlog.py)
+#     Each says why on the terminal once the launcher has gone.
 # slirp4netns has no flow log, so with it the records are the start, the end
 # and the DNS relay's lookups -- which are then the only account of what the
 # sandbox reached for, and the reason the relay is not left to pasta.  The
@@ -2672,6 +2682,10 @@ _NET_LOG_PIPE=0
 # how long (seconds) the launcher waits for it to say it is ready.
 _NET_LOG_COND_PID=""
 _NET_LOG_READY_WAIT=10
+# The read end of the pipe the condenser holds open (end of file: it has
+# gone), and the FIFO the DNS relay holds open for the condenser.
+_NET_LOG_WATCH_FD=""
+_NET_LOG_LIFELINE=""
 _NET_LOG_TOOL=""
 _NET_LOG_TOOLS=()
 _NET_LOG_SESSION=""
@@ -2841,20 +2855,27 @@ _net_log_start() {
             mkfifo -m 0600 "${_NET_LOG_ERR_FIFO}"
             _err="${_NET_LOG_ERR_FIFO}"
         fi
-        local -a _pre=(2 note "${_NET_LOG_MARKER}")
+        local -a _pre=()
         if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
             # The DNS relay, started by the descriptor relay in the sandbox's
             # network namespace (outside bwrap), logs on the same FIFO and
             # forwards to the backend's own DNS address.  Under pasta it
             # binds port 53 itself; under slirp4netns the exec chain has no
             # capabilities, so it takes the sockets _NET_NS_IDENTITY bound.
+            # It holds the lifeline FIFO open, and the condenser ends the
+            # session if it closes.  Started before the marker, so that if it
+            # fails the condenser shows why on the terminal.
             local _udp=- _tcp=-
             if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
                 _udp="${_NET_FD_DNS_UDP}"
                 _tcp="${_NET_FD_DNS_TCP}"
             fi
-            _pre+=(2 spawn "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}" "${_udp}" "${_tcp}")
+            _NET_LOG_LIFELINE="${_NET_SESSION_DIR}/relay"
+            mkfifo -m 0600 "${_NET_LOG_LIFELINE}"
+            _pre+=(2 spawn "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}"
+                "${_udp}" "${_tcp}" "${_NET_LOG_LIFELINE}")
         fi
+        _pre+=(2 note "${_NET_LOG_MARKER}")
         _BWRAP_FD_RELAY=("${_pre[@]}" 2 append "${_err}" ${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"})
     else
         # --share-net: no FIFO, only the end record to write.
@@ -2864,25 +2885,28 @@ _net_log_start() {
 
     # The condenser reads the FIFO: pasta's flows, the DNS relay's lookups,
     # or both.  It says "ready" on descriptor 3 once it has it open, so that
-    # nothing written to it is lost; its stderr is the user's, for what the
-    # backend said if the start fails.
+    # nothing written to it is lost, and keeps descriptor 3 open until it
+    # exits: the read end becomes _NET_LOG_WATCH_FD, which the keeper
+    # (_net_hold_run) watches.  Its stderr is the user's, for what the
+    # backend said if the start fails and why it ended a session.
     local -a _cond=("${_NET_LOG_PY}" -I -S "${_NET_LOG_HELPER}" condense
         --session "${_NET_LOG_SESSION}" --user "${_NET_LOG_USER}" --dns-forward "${_NET_DNS_FORWARD_ADDR}"
         --fifo "${_NET_LOG_FIFO}" --parent "$$" --marker "${_NET_LOG_MARKER}"
         --end-record "$(_net_log_record end)" --session-dir "${_NET_SESSION_DIR}"
-        --backend "${_NET_BACKEND}")
+        --backend "${_NET_BACKEND}" --launcher "${_launcher}")
     [[ -z "${_NET_LOG_ERR_FIFO}" ]] || _cond+=(--stderr-fifo "${_NET_LOG_ERR_FIFO}")
+    [[ -z "${_NET_LOG_LIFELINE}" ]] || _cond+=(--relay-lifeline "${_NET_LOG_LIFELINE}")
     exec {_rfd}< <(exec setsid "${_cond[@]}" -- "${_NET_LOG_CMD[@]}" 3>&1 > /dev/null < /dev/null)
     # setsid does not fork here (the process substitution is not a process
     # group leader), so $! is the condenser itself.
     _NET_LOG_COND_PID="$!"
     IFS= read -r -t "${_NET_LOG_READY_WAIT}" _ready <&"${_rfd}" || _ready=""
-    exec {_rfd}<&-
     if [[ "${_ready}" != ready ]]; then
         _net_log_abort condenser-failed \
             "the network log condenser did not start, so connections and lookups could not be logged." \
             "Check that ${_NET_LOG_PY} can run ${_NET_LOG_HELPER}."
     fi
+    _NET_LOG_WATCH_FD="${_rfd}"
 }
 
 # _net_log_abort REASON MESSAGE [MORE...]
@@ -2988,15 +3012,17 @@ _net_log_print_dry_run() {
         printf '# The descriptor relay starts the DNS relay on %s:%s in the namespace:\n' \
             "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_RELAY_PORT}"
         if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
-            printf '#   %s -I %s dns %s %s <relay pid> %s %s\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" \
-                "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}" "${_NET_FD_DNS_UDP}" "${_NET_FD_DNS_TCP}"
+            printf '#   %s -I %s dns %s %s <relay pid> %s %s <session dir>/relay\n' "${_NET_LOG_PY}" \
+                "${_NET_LOG_HELPER}" "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}" "${_NET_FD_DNS_UDP}" "${_NET_FD_DNS_TCP}"
             printf '# on the sockets descriptors %s and %s already hold: the namespace maps your own\n' \
                 "${_NET_FD_DNS_UDP}" "${_NET_FD_DNS_TCP}"
             printf '# uid, so nothing after the exec can bind port %s and they are bound before it.\n' "${_NET_DNS_RELAY_PORT}"
         else
-            printf '#   %s -I %s dns %s %s <relay pid> - -\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" \
-                "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}"
+            printf '#   %s -I %s dns %s %s <relay pid> - - <session dir>/relay\n' "${_NET_LOG_PY}" \
+                "${_NET_LOG_HELPER}" "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}"
         fi
+        printf '# If the relay does not start, bwrap is not started.  If it, the condenser or the\n'
+        printf '# log tool stops during the session, the session is ended.\n'
     fi
 }
 
@@ -3454,51 +3480,88 @@ net_hold_fd() {
 }
 
 # _net_hold_start
-#   Just before the `exec`: start a background holder that keeps the registered
-#   descriptors open until the launcher process (which is pasta, or the identity
-#   mapper, after the exec) has gone, as the network log helper does.  It only
-#   has to outlive the sandbox, and it does not depend on a log tool working.
-#   Not used without a private network: the descriptors then pass through
-#   `exec` themselves.
+#   Just before the `exec`: start a background keeper that keeps the
+#   registered descriptors open until the launcher process (which is pasta,
+#   or the identity mapper, after the exec) has gone, and that ends the
+#   session if the network log's condenser exits before it (it watches
+#   _NET_LOG_WATCH_FD, the read end of a pipe only the condenser can write).
+#   It only has to outlive the sandbox, and it does not depend on a log tool
+#   working.  Not used without a private network: the descriptors then pass
+#   through `exec` themselves, and there is no condenser.
 _net_hold_start() {
-    [[ "${#NET_HOLD_FDS[@]}" -gt 0 ]] || return 0
+    [[ "${#NET_HOLD_FDS[@]}" -gt 0 || -n "${_NET_LOG_WATCH_FD}" ]] || return 0
     [[ "${_NET_BACKEND}" == pasta || "${_NET_BACKEND}" == slirp4netns ]] || return 0
-    # The holder runs on the host, outside the sandbox, for the whole session:
+    # The keeper runs on the host, outside the sandbox, for the whole session:
     # it waits with the system's own sleep, never one found through PATH,
     # which can include a directory the sandbox can write to.
     _NET_HOLD_SLEEP=/usr/bin/sleep
     [[ -x "${_NET_HOLD_SLEEP}" ]] || _NET_HOLD_SLEEP=/bin/sleep
     if [[ ! -x "${_NET_HOLD_SLEEP}" ]]; then
-        printf 'Warning: %s: no /usr/bin/sleep or /bin/sleep; the database lock is not held for this session.\n' "${0##*/}" >&2
-        return 0
+        printf 'Error: %s: no /usr/bin/sleep or /bin/sleep, which the network session needs.\n' "${0##*/}" >&2
+        exit 3
     fi
     _net_hold_run &
 }
 
 # _net_hold_run
-#   The holder: runs in a subshell (it is started with `&`; $$ is still the
+#   The keeper: runs in a subshell (it is started with `&`; $$ is still the
 #   launcher).  It ignores the signals meant for the session, and closes every
-#   descriptor it inherited except the registered ones, so that it keeps
-#   nothing else alive (slirp4netns exits only when bwrap closes the sync
-#   descriptor).
+#   descriptor it inherited except the registered ones and the condenser's
+#   pipe, so that it keeps nothing else alive (slirp4netns exits only when
+#   bwrap closes the sync descriptor).  It keeps stderr only while it has the
+#   condenser to watch, to say why it ended a session.
 _net_hold_run() {
-    local _f _n _keep
+    local _f _n _keep _w="${_NET_LOG_WATCH_FD}" _x _rc _ended=0
     set +e
     trap '' INT QUIT TSTP HUP TERM PIPE
-    exec < /dev/null > /dev/null 2>&1
+    exec < /dev/null > /dev/null
+    [[ -n "${_w}" ]] || exec 2> /dev/null
     for _f in /proc/self/fd/*; do
         _n="${_f##*/}"
-        [[ "${_n}" =~ ^[0-9]+$ && "${_n}" -gt 2 ]] || continue
-        for _keep in "${NET_HOLD_FDS[@]}"; do
+        [[ "${_n}" =~ ^[0-9]+$ && "${_n}" -gt 2 && "${_n}" != "${_w}" ]] || continue
+        for _keep in ${NET_HOLD_FDS[@]+"${NET_HOLD_FDS[@]}"}; do
             [[ "${_n}" == "${_keep}" ]] && continue 2
         done
         eval "exec ${_n}>&-" 2> /dev/null
     done
     while _net_launcher_alive; do
+        if [[ -n "${_w}" ]]; then
+            IFS= read -r -t 1 _x <&"${_w}"
+            _rc=$?
+            # A timeout, or a line (none is expected): the condenser is there.
+            [[ ${_rc} -gt 128 || ${_rc} -eq 0 ]] && continue
+            # End of file: the condenser has gone.  When the session ends it
+            # goes after the launcher; still having the launcher means it
+            # failed, and the session must not go on unlogged.
+            eval "exec ${_w}<&-"
+            _w=""
+            if _net_launcher_alive; then
+                _ended=1
+                _net_hold_end_launcher
+            fi
+            continue
+        fi
         # A failed sleep (no fork, killed) only retries: ending would drop the lock.
         "${_NET_HOLD_SLEEP}" 1 || :
     done
+    if [[ "${_ended}" -eq 1 ]]; then
+        printf 'Error: %s: the network log stopped (its condenser exited); the session was ended.\n' "${0##*/}" >&2
+    fi
     exit 0
+}
+
+# _net_hold_end_launcher
+#   End the launcher process (pasta, whose children go with it, or bwrap):
+#   SIGTERM, then SIGKILL after 3 s.  Signalled only while it is still the
+#   caller's parent, so its pid cannot have been reused.
+_net_hold_end_launcher() {
+    local _i
+    _net_launcher_alive && kill -TERM "$$" 2> /dev/null
+    for ((_i = 0; _i < 30; _i++)); do
+        _net_launcher_alive || return 0
+        "${_NET_HOLD_SLEEP}" 0.1 || :
+    done
+    _net_launcher_alive && kill -KILL "$$" 2> /dev/null
 }
 
 # _net_slirp_quit
@@ -5499,16 +5562,19 @@ _bwrap_toml_string() {
 #   note TEXT  the relay prints TEXT on the descriptor (a marker on stderr).
 #   append PATH  the relay opens PATH for appending on the descriptor (the
 #              user's stderr again).
-#   spawn PY HELPER LISTEN UPSTREAM UDPFD TCPFD  the relay starts the DNS
-#              relay (`PY -I -S HELPER dns LISTEN UPSTREAM <relay pid> UDPFD
-#              TCPFD`) in the background, its output on the descriptor, and
-#              waits until it listens (it says so on descriptor 3; a Python
-#              start, some tens of milliseconds), at most 0.25 s, so the
-#              first lookups are logged too.  UDPFD and TCPFD are sockets
-#              already bound (slirp4netns) or "-" (pasta: the relay binds);
-#              the relay closes its own copies afterwards.
+#   spawn PY HELPER LISTEN UPSTREAM UDPFD TCPFD LIFELINE  the relay starts
+#              the DNS relay (`PY -I -S HELPER dns LISTEN UPSTREAM <relay pid>
+#              UDPFD TCPFD LIFELINE`) in the background, its output on the
+#              descriptor, and waits until it listens (it says so on
+#              descriptor 3; a Python start, some tens of milliseconds), so
+#              the first lookups are logged too.  If it has not said so within
+#              10 s, the relay stops with exit 126 and bwrap never starts.
+#              UDPFD and TCPFD are sockets already bound (slirp4netns) or "-"
+#              (pasta: the relay binds); the relay closes its own copies
+#              afterwards.  LIFELINE is the condenser's FIFO (see "Network
+#              log"), or "-".
 # Every walker of _BWRAP_FD_RELAY (_bwrap_fd_data_numbers) must step over
-# exactly as many words per entry as the shim shifts: data 2, spawn 8, the
+# exactly as many words per entry as the shim shifts: data 2, spawn 9, the
 # rest 3.
 
 # _bwrap_fd_check_room
@@ -5589,13 +5655,18 @@ while [[ $# -gt 0 && "$1" != -- ]]; do
             shift 3
             ;;
         spawn)
-            coproc _bwrap_dns { exec "$3" -I -S "$4" dns "$5" "$6" "$$" "$7" "$8" 3>&1 1>&"$1" 2>&"$1" < /dev/null; }
-            read -r -t 0.25 _v <&"${_bwrap_dns[0]}"
+            coproc _bwrap_dns { exec "$3" -I -S "$4" dns "$5" "$6" "$$" "$7" "$8" "$9" 3>&1 1>&"$1" 2>&"$1" < /dev/null; }
+            _v=""
+            read -r -t 10 _v <&"${_bwrap_dns[0]}"
             eval "exec ${_bwrap_dns[0]}<&- ${_bwrap_dns[1]}>&-"
             # Pre-bound sockets: the relay has its own copies, so close ours
             # rather than leak listening sockets into the sandbox.
             [[ "$7" == - ]] || eval "exec $7<&- $8<&-"
-            shift 8
+            if [[ "${_v}" != ready ]]; then
+                echo "$0: the DNS relay did not start, so lookups could not be logged" >&2
+                exit 126
+            fi
+            shift 9
             ;;
         *)
             echo "$0: bad relay entry: $2" >&2
@@ -5639,7 +5710,7 @@ _bwrap_fd_data_numbers() {
                 ;;
             # Must match the shim's `shift` for spawn (see
             # _BWRAP_FD_RELAY_SHIM); tests/test_fd_relay.py checks the two.
-            spawn) _r=$((_r + 8)) ;;
+            spawn) _r=$((_r + 9)) ;;
             *) _r=$((_r + 3)) ;;
         esac
     done
@@ -5924,8 +5995,12 @@ launch_sandbox() {
     done
 
     [[ "${_NET_BACKEND}" != slirp4netns ]] || _net_slirp_start
-    # Before stderr goes to the log FIFO below, so the holder never has it.
+    # Before stderr goes to the log FIFO below, so the keeper never has it.
     _net_hold_start
+    # Only the keeper watches the condenser's pipe.
+    if [[ -n "${_NET_LOG_WATCH_FD}" ]]; then
+        exec {_NET_LOG_WATCH_FD}<&-
+    fi
     if [[ -n "${_NET_LOG_FIFO}" ]]; then
         # pasta's stderr goes to the network log (see "Network log"): a
         # write-only, append descriptor, the only kind SELinux lets pasta

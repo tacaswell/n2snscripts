@@ -240,5 +240,89 @@ class NetHoldTest(unittest.TestCase):
         self.assertEqual(out.stdout.decode().strip(), "7 12")
 
 
+# The keeper also watches the condenser: $2 is the read end of a pipe whose
+# only writer (the test) stands for the condenser.  The stand-in for pasta
+# sleeps $4 seconds; $5 is the file it makes once it has closed its
+# descriptors.
+WATCH_DRIVER = r"""
+source "$1" 2>/dev/null
+_NET_BACKEND=pasta
+_NET_LOG_WATCH_FD="$2"
+_net_hold_start
+exec {_NET_LOG_WATCH_FD}<&-
+exec "$3" -c 'import os, sys, time; os.closerange(3, 1024); open(sys.argv[2], "w").close(); time.sleep(float(sys.argv[1]))' "$4" "$5"
+"""
+
+
+class CondenserWatchTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="net-watch-test.")
+        self.ready = os.path.join(self.dir, "ready")
+        self.read, self.write = os.pipe()
+        self.proc = None
+
+    def tearDown(self):
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                self.proc.kill()
+                self.proc.wait()
+            self.proc.stderr.close()
+        for fd in (self.read, self.write):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def start(self, life=30):
+        self.proc = subprocess.Popen(
+            ["bash", "-c", WATCH_DRIVER, "_", LIB, str(self.read), sys.executable, str(life), self.ready],
+            pass_fds=(self.read,),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self.assertTrue(wait_for(lambda: os.path.exists(self.ready), 10))
+        os.close(self.read)  # the test keeps only the write end
+        self.read = os.open(os.devnull, os.O_RDONLY)  # something harmless for tearDown to close
+        self.keeper = children_of(self.proc.pid)
+        self.assertEqual(len(self.keeper), 1, self.keeper)
+
+    def stderr(self):
+        return self.proc.stderr.read().decode()  # once the keeper, which has it too, has gone
+
+    def test_a_condenser_that_exits_ends_the_session(self):
+        self.start()
+        time.sleep(1.5)
+        self.assertIsNone(self.proc.poll(), "ended while the condenser was there")
+        os.close(self.write)  # the condenser has gone
+        self.write = os.dup(self.read)
+        self.proc.wait(timeout=10)
+        self.assertEqual(self.proc.returncode, -signal.SIGTERM)
+        err = self.stderr()
+        self.assertIn("the network log stopped (its condenser exited); the session was ended", err)
+        self.assertTrue(wait_for(lambda: process_gone(self.keeper[0]), 5))
+
+    def test_a_normal_end_is_not_reported(self):
+        self.start(life=1)
+        self.proc.wait(timeout=10)  # the sandbox ends first...
+        self.assertEqual(self.proc.returncode, 0)
+        os.close(self.write)  # ...and then the condenser
+        self.write = os.dup(self.read)
+        self.assertEqual(self.stderr(), "")
+        self.assertTrue(wait_for(lambda: process_gone(self.keeper[0]), 5))
+
+    def test_the_keeper_ignores_the_signals_of_the_session(self):
+        self.start()
+        for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT):
+            os.kill(self.keeper[0], sig)
+        time.sleep(1)
+        self.assertFalse(process_gone(self.keeper[0]))
+        os.close(self.write)
+        self.write = os.dup(self.read)
+        self.proc.wait(timeout=10)
+        self.assertEqual(self.proc.returncode, -signal.SIGTERM)
+
+
 if __name__ == "__main__":
     sys.exit(unittest.main())

@@ -136,6 +136,61 @@ class NetLogStartTest(unittest.TestCase):
         self.assertTrue(any("event=end session=abc" in ln for ln in lines), lines)
         self.assertFalse(any("event=abort" in ln for ln in lines), lines)
 
+    def test_a_condenser_killed_mid_session_ends_it(self):
+        # The whole chain: the real condenser keeps its "ready" pipe open, the
+        # keeper watches it, and the stand-in for pasta is ended once the
+        # condenser is gone (here killed outright, so it cannot say anything).
+        script = DRIVER.replace(
+            "echo continued",
+            "_net_hold_start\nexec {_NET_LOG_WATCH_FD}<&-\nexec sleep 60",
+        )
+        proc = subprocess.Popen(
+            ["bash", "-c", script, "_", LIB, self.dir, FAKES, sys.executable, HELPER],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            condenser = None
+            for _ in range(100):
+                condenser = next((p for p in children(proc.pid) if b"condense" in cmdline(p)), None)
+                if condenser:
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(condenser, "no condenser found")
+            time.sleep(1)
+            self.assertIsNone(proc.poll())
+            os.kill(condenser, 9)
+            proc.wait(timeout=15)
+            self.assertEqual(proc.returncode, -15)
+            self.assertIn("the network log stopped (its condenser exited)", proc.stderr.read().decode())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            proc.stderr.close()
+
+
+def children(pid):
+    out = []
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            try:
+                with open("/proc/%s/stat" % name) as f:
+                    if int(f.read().rsplit(")", 1)[1].split()[1]) == pid:
+                        out.append(int(name))
+            except OSError:
+                pass
+    return out
+
+
+def cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
 
 if __name__ == "__main__":
     unittest.main()

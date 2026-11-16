@@ -5,7 +5,8 @@ platform-python) and later.
 
     bwrap_netlog.py condense --session ID [--user NAME] [--dns-forward ADDR]
         [--fifo PATH --parent PID [--marker TEXT] [--end-record TEXT]
-         [--session-dir DIR] [--backend NAME]] -- CMD...
+         [--session-dir DIR] [--backend NAME] [--launcher NAME]
+         [--relay-lifeline PATH]] -- CMD...
         Read pasta's debug output (its stderr, and the DNS relay's lines) and
         write one line when a connection opens and one when it closes, with
         the domain of the destination when the relay saw it, to CMD's
@@ -14,15 +15,22 @@ platform-python) and later.
         its setup dump) is dropped.  Without --fifo it filters standard
         input; with it, it reads the FIFO (see the launcher's "Network log")
         until the launcher, PID, has exited, then writes the end record.
+        With --fifo the session is not left running unlogged: when the log
+        tool exits or stops reading, or the DNS relay (watched through the
+        FIFO --relay-lifeline) goes away, it ends the launcher (see
+        SessionEnder).  It says "ready" on descriptor 3 and keeps it open
+        until it exits, so the launcher can tell when it is gone.
 
-    bwrap_netlog.py dns LISTEN UPSTREAM PARENT_PID [UDP_FD TCP_FD]
+    bwrap_netlog.py dns LISTEN UPSTREAM PARENT_PID [UDP_FD TCP_FD [LIFELINE]]
         A DNS relay for the sandbox's network namespace: listen on LISTEN
         (ADDR or ADDR:PORT, UDP and TCP), forward every query to UPSTREAM
         (the backend's DNS address) and print one line per query on standard
         output.  It exits when PARENT_PID (the descriptor relay, which
         becomes bwrap) does.  UDP_FD and TCP_FD are sockets already bound to
         LISTEN, for a namespace where this process cannot bind port 53
-        itself; "-" means bind here (see DnsRelay.adopt).
+        itself; "-" means bind here (see DnsRelay.adopt).  LIFELINE is the
+        condenser's FIFO, held open for writing while the relay runs; "-"
+        for none.
 
 Output lines are logfmt (key=value), so Loki's `| logfmt` can filter them.
 Every line names the session and the user who started it (--user), so a line
@@ -338,9 +346,12 @@ def _bridge_stderr(path, stop):
 # would stall the sandbox's network).  The bound is generous: a tool that is
 # merely slow, behind a burst, still gets every record.  At the end the end
 # record and the queue get SINK_CLOSE_WAIT seconds in all, and then the tool
-# that many more to exit, before it is killed.
+# that many more to exit, before it is killed.  A write that has not finished
+# after SINK_STALL seconds means the tool has stopped reading, and the
+# session is ended (SessionEnder).
 SINK_BYTES = 8 * 1024 * 1024
 SINK_CLOSE_WAIT = 5
+SINK_STALL = 30
 
 
 class BoundedSink:
@@ -363,6 +374,7 @@ class BoundedSink:
         self.dropped_total = 0
         self.dead = False
         self.closing = False
+        self.writing_since = None  # monotonic time the current write began
         self.cond = threading.Condition()
         self.thread = threading.Thread(target=self._run)
         self.thread.daemon = True
@@ -383,6 +395,7 @@ class BoundedSink:
                 self.cond.notify_all()
             if self.dead:
                 continue
+            self.writing_since = time.monotonic()
             try:
                 view = memoryview(b"".join(batch))
                 while view:
@@ -390,6 +403,12 @@ class BoundedSink:
                 self.out.flush()
             except (BrokenPipeError, OSError, ValueError):
                 self.dead = True
+            self.writing_since = None
+
+    def stalled(self, seconds):
+        """True when the current write has taken more than SECONDS."""
+        since = self.writing_since
+        return since is not None and time.monotonic() - since > seconds
 
     def put(self, data, wait=0):
         """Queue DATA; wait up to WAIT seconds for room.  True if queued.
@@ -433,6 +452,108 @@ class BoundedSink:
         return not self.thread.is_alive()
 
 
+# How long the relay's lifeline may be gone while the launcher is still there
+# before that counts as the relay failing: when the sandbox ends, the relay
+# goes with bwrap and pasta follows at once.
+RELAY_GONE_GRACE = 3
+# How long the launcher gets to exit after SIGTERM before SIGKILL.
+END_TERM_WAIT = 3
+
+
+class SessionEnder:
+    """End the session, once, when it would otherwise go on unlogged.
+
+    The launcher process is pasta (its SIGTERM ends it, and bwrap, run with
+    --die-with-parent, dies with it) or, with slirp4netns, bwrap itself.  It
+    is signalled only while it is still this process's parent, so its pid
+    cannot have been reused.  The reason is written to the log at once and
+    to the terminal (this process's stderr) once the launcher has gone, so
+    that a full-screen program ending does not wipe it.
+    """
+
+    def __init__(self, parent, launcher, emit, tool="log tool"):
+        self.parent = parent
+        self.launcher = launcher
+        self.emit = emit
+        self.tool = tool
+        self.lock = threading.Lock()
+        self.reason = None
+        self.message = None
+
+    def end(self, reason, message):
+        with self.lock:
+            if self.reason is not None:
+                return
+            self.reason, self.message = reason, message
+        try:
+            self.emit("condense level=error msg=%s action=end-session" % reason)
+        except Exception:
+            pass
+        t = threading.Thread(target=self._kill)
+        t.daemon = True
+        t.start()
+
+    def _kill(self):
+        for sig, wait in ((signal.SIGTERM, END_TERM_WAIT), (signal.SIGKILL, 0)):
+            if not _parent_is(self.parent):
+                return
+            try:
+                os.kill(self.parent, sig)
+            except OSError:
+                return
+            deadline = time.monotonic() + wait
+            while time.monotonic() < deadline and _parent_is(self.parent):
+                time.sleep(0.05)
+
+    def report(self):
+        if self.message:
+            sys.stderr.write("Error: %s: %s; the session was ended.\n" % (self.launcher, self.message))
+            sys.stderr.flush()
+
+
+def _watch_session(parent, ender, sink=None, proc=None, lifeline=None, poll_ms=500):
+    """Until the launcher has gone, end the session when the log tool exits
+    or stops reading, or when the relay's end of LIFELINE (a descriptor
+    opened read-only, non-blocking) closes."""
+    import select
+
+    p = None
+    if lifeline is not None:
+        p = select.poll()
+        p.register(lifeline, select.POLLIN)
+    try:
+        while _parent_is(parent):
+            if p is not None:
+                # Before the relay opens it a FIFO reports nothing; after it
+                # closes, POLLHUP and an empty read.
+                if p.poll(poll_ms):
+                    try:
+                        data = os.read(lifeline, 512)
+                    except (BlockingIOError, InterruptedError):
+                        data = None
+                    if data == b"":
+                        p = None
+                        deadline = time.monotonic() + RELAY_GONE_GRACE
+                        while time.monotonic() < deadline and _parent_is(parent):
+                            time.sleep(0.1)
+                        if _parent_is(parent):
+                            ender.end(
+                                "dns-relay-stopped", "the DNS relay stopped, so lookups could no longer be logged"
+                            )
+                            return
+            else:
+                time.sleep(poll_ms / 1000.0)
+            if sink is not None and _parent_is(parent):
+                if sink.dead or (proc is not None and proc.poll() is not None):
+                    ender.end("log-tool-stopped", "the log tool (%s) stopped" % ender.tool)
+                    return
+                if sink.stalled(SINK_STALL):
+                    ender.end("log-tool-stalled", "the log tool (%s) stopped reading" % ender.tool)
+                    return
+    except Exception as e:  # a watcher that fails must not leave the session unwatched
+        ender.end("watch-failed", "the network log's watcher failed (%r)" % (e,))
+
+
 def condense(argv):
     """Condense pasta's debug log into the system log.
 
@@ -449,7 +570,7 @@ def condense(argv):
 
     session, user, dns_forward, cmd = "", "", "169.254.1.1", []
     fifo, parent, marker, end_record, session_dir, stderr_fifo = None, None, None, None, None, None
-    backend = "pasta"
+    backend, launcher, lifeline_path = "pasta", "bwrap_netlog", None
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -473,6 +594,10 @@ def condense(argv):
             stderr_fifo = argv[i + 1]
         elif a == "--backend":
             backend = argv[i + 1]
+        elif a == "--launcher":
+            launcher = argv[i + 1]
+        elif a == "--relay-lifeline":
+            lifeline_path = argv[i + 1]
         elif a == "--":
             cmd = argv[i + 1 :]
             break
@@ -548,15 +673,22 @@ def condense(argv):
             feed(raw.decode("utf-8", "replace"))
     else:
         reader = FifoReader(fifo, lambda: not _parent_is(parent))
+        # Opened before "ready", so the relay's write-only open finds a reader.
+        lifeline = os.open(lifeline_path, os.O_RDONLY | os.O_NONBLOCK) if lifeline_path else None
+        ender = SessionEnder(parent, launcher, emit, os.path.basename(cmd[0]) if cmd else "log tool")
+        watcher = threading.Thread(target=_watch_session, args=(parent, ender, sink, proc, lifeline))
+        watcher.daemon = True
+        watcher.start()
         bridge, bridge_stop = None, threading.Event()
         if stderr_fifo:
             bridge = threading.Thread(target=_bridge_stderr, args=(stderr_fifo, bridge_stop))
             bridge.daemon = True
             bridge.start()
         # The launcher waits for this before it opens its stderr on the FIFO.
+        # Descriptor 3 stays open until this process exits: the launcher's
+        # keeper (_net_hold_run) ends the session when it closes early.
         try:
             os.write(3, b"ready\n")
-            os.close(3)
         except OSError:
             pass
         started, early = marker is None, []
@@ -579,6 +711,8 @@ def condense(argv):
         if bridge:
             bridge_stop.set()
             bridge.join(5)
+        watcher.join(2)
+        ender.report()
     c.finish()
     if sink is None:
         if end_record:
@@ -966,6 +1100,7 @@ def dns(argv):
     fds = None
     if len(argv) >= 5 and argv[3] != "-":
         fds = (int(argv[3]), int(argv[4]))
+    lifeline = argv[5] if len(argv) >= 6 and argv[5] != "-" else None
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         libc.prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
@@ -979,6 +1114,12 @@ def dns(argv):
             relay.bind()
         else:
             relay.adopt(*fds)
+        if lifeline is not None:
+            # Held open, never inherited, for as long as the relay runs: the
+            # condenser ends the session when it closes (see _watch_session).
+            # Non-blocking, so a condenser that is already gone fails here.
+            fd = os.open(lifeline, os.O_WRONLY | os.O_NONBLOCK)
+            os.write(fd, b"up\n")
     except OSError as e:
         sys.stdout.write("bwrap-dns domain=- type=- proto=- rcode=RELAY-FAILED answers=%s\n" % _value(str(e)))
         sys.stdout.flush()
@@ -995,7 +1136,7 @@ def dns(argv):
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "condense":
         condense(sys.argv[2:])
-    elif len(sys.argv) in (5, 7) and sys.argv[1] == "dns":
+    elif len(sys.argv) in (5, 7, 8) and sys.argv[1] == "dns":
         try:
             dns(sys.argv[2:])
         except KeyboardInterrupt:

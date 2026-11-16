@@ -519,6 +519,128 @@ class StalledLogToolTest(unittest.TestCase):
         self.assertEqual(len(res.stdout.splitlines()), 5000)
 
 
+class SessionEndTest(unittest.TestCase):
+    """condense --fifo ends the launcher when the log could no longer be kept.
+
+    The launcher is a bash that starts the condenser in the background and
+    then execs sleep, so the condenser's parent is the sleep, as it is pasta
+    (or bwrap) in a real session.
+    """
+
+    LIB = os.path.join(HERE, "..", "lib")
+    DRIVER = r"""
+d="$1"; shift
+"$@" --fifo "$d/netlog" --parent $$ --relay-lifeline "$d/relay" --launcher bwtest \
+    --end-record "event=end session=abc" --session-dir "$d/session" -- "${TOOL[@]}" 3> "$d/ready" &
+exec sleep 60
+"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="netlog-end.")
+        os.mkfifo(os.path.join(self.dir, "netlog"))
+        os.mkfifo(os.path.join(self.dir, "relay"))
+        os.mkdir(os.path.join(self.dir, "session"))
+        self.out = os.path.join(self.dir, "out")
+        self.proc = None
+        self.fds = []
+
+    def tearDown(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        for fd in self.fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        import shutil
+
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def start(self, tool):
+        script = (
+            "import sys; sys.path.insert(0, %r); import bwrap_netlog as n; "
+            "n.RELAY_GONE_GRACE = 0.5; n.SINK_STALL = 1; n.END_TERM_WAIT = 1; n.condense(sys.argv[1:])" % self.LIB
+        )
+        self.proc = subprocess.Popen(
+            ["bash", "-c", "TOOL=(%s); %s" % (" ".join("'%s'" % t for t in tool), self.DRIVER), "_", self.dir]
+            + [sys.executable, "-c", script, "--session", "abc"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        ready = os.path.join(self.dir, "ready")
+        for _ in range(100):
+            try:
+                with open(ready) as f:
+                    if f.read() == "ready\n":
+                        break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        else:
+            self.fail("the condenser did not say it was ready")
+
+    def relay_up(self):
+        fd = os.open(os.path.join(self.dir, "relay"), os.O_WRONLY | os.O_NONBLOCK)
+        os.write(fd, b"up\n")
+        return fd
+
+    def finish(self, timeout=20):
+        self.proc.wait(timeout=timeout)
+        err = self.proc.stderr.read().decode()  # once the condenser, which has it too, has gone
+        self.proc.stderr.close()
+        try:
+            with open(self.out) as f:
+                log = f.read().splitlines()
+        except OSError:
+            log = []
+        return err, log
+
+    def test_relay_that_stops_ends_the_session(self):
+        self.start(["tee", self.out])
+        fd = self.relay_up()
+        time.sleep(0.5)
+        self.assertIsNone(self.proc.poll(), "ended while the relay was up")
+        os.close(fd)
+        err, log = self.finish()
+        self.assertEqual(self.proc.returncode, -15)
+        self.assertIn("Error: bwtest: the DNS relay stopped", err)
+        self.assertIn("the session was ended", err)
+        self.assertTrue(any("msg=dns-relay-stopped action=end-session" in ln for ln in log), log)
+        self.assertEqual(log[-1], "event=end session=abc")
+
+    def test_log_tool_that_exits_ends_the_session(self):
+        self.start(["true"])
+        self.relay_up()
+        err, _ = self.finish()
+        self.assertEqual(self.proc.returncode, -15)
+        self.assertIn("the log tool (true) stopped", err)
+
+    def test_log_tool_that_stops_reading_ends_the_session(self):
+        self.start(["sh", "-c", "exec sleep 60"])
+        self.fds.append(self.relay_up())
+        fd = os.open(os.path.join(self.dir, "netlog"), os.O_WRONLY)
+        self.fds.append(fd)
+        line = b"bwrap-dns domain=host.example.org type=A proto=udp rcode=NOERROR answers=192.0.2.1\n"
+        os.write(fd, line * 3000)  # far more than the pipe to the tool holds
+        err, _ = self.finish(timeout=30)
+        self.assertEqual(self.proc.returncode, -15)
+        self.assertIn("the log tool (sh) stopped reading", err)
+
+    def test_a_normal_end_is_not_reported(self):
+        self.start(["tee", self.out])
+        fd = self.relay_up()
+        time.sleep(0.3)
+        self.proc.terminate()  # the sandbox ends: the launcher goes first...
+        self.proc.wait(timeout=10)
+        os.close(fd)  # ...and the relay with it
+        err, log = self.finish()
+        self.assertEqual(err, "")
+        self.assertFalse(any("end-session" in ln for ln in log), log)
+        self.assertEqual(log[-1], "event=end session=abc")
+
+
 class DnsParseTest(unittest.TestCase):
     def test_query(self):
         self.assertEqual(netlog.parse_query(query("WWW.Example.org", 28)), ("www.example.org", "AAAA"))

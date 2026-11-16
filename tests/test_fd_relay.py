@@ -12,8 +12,10 @@ These tests give one list to both and check every data descriptor arrives.
 """
 
 import os
+import socket
 import subprocess
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,9 +41,10 @@ exec env "${env[@]}" bash -c "${_BWRAP_FD_RELAY_SHIM}" bwrap-fd-relay "${_BWRAP_
 DATA = ["10", "data", "11", "data", "12", "data"]
 
 
-def relay(*entries):
+def relay(*entries, pass_fds=()):
     got = subprocess.run(
         ["bash", "-c", DRIVER, "_", LIB, *entries],
+        pass_fds=pass_fds,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=30,
@@ -53,8 +56,8 @@ def relay(*entries):
 
 
 class FdRelayTest(unittest.TestCase):
-    def assert_all_data_arrive(self, *entries):
-        walker, fields, got = relay(*entries)
+    def assert_all_data_arrive(self, *entries, pass_fds=()):
+        walker, fields, got = relay(*entries, pass_fds=pass_fds)
         self.assertEqual(walker, "walker: 10 11 12", got.stderr.decode())
         self.assertEqual(fields, {"10": "RESOLV", "11": "HOSTS", "12": "CONTEXT"})
 
@@ -62,50 +65,78 @@ class FdRelayTest(unittest.TestCase):
         self.assert_all_data_arrive(*DATA)
 
     def test_after_the_network_log_entries_pasta(self):
-        """note, spawn (relay binds for itself: "- -") and append first."""
+        """spawn (relay binds for itself: "- -"), note and append first."""
         self.assert_all_data_arrive(
-            "2",
-            "note",
-            "MARK",
             "2",
             "spawn",
             sys.executable,
             HELPER,
-            "127.0.0.1:5399",
+            "127.0.0.1:0",
             "127.0.0.1:9",
             "-",
             "-",
+            "-",
+            "2",
+            "note",
+            "MARK",
             "2",
             "append",
             os.devnull,
             *DATA,
         )
 
+    def test_a_relay_that_does_not_start_stops_the_relay(self):
+        """bwrap (here the command after --) never runs without the DNS relay."""
+        bad = os.path.join(os.path.dirname(HELPER), "no-such-helper.py")
+        walker, fields, got = relay(
+            "2", "spawn", sys.executable, bad, "127.0.0.1:0", "127.0.0.1:9", "-", "-", "-", *DATA
+        )
+        self.assertEqual(got.returncode, 126)
+        self.assertEqual(fields, {})  # (the driver discards the relay's stderr)
+
+    def test_a_relay_whose_lifeline_has_no_reader_does_not_start(self):
+        with tempfile.TemporaryDirectory() as d:
+            lifeline = os.path.join(d, "relay")
+            os.mkfifo(lifeline)
+            walker, fields, got = relay(
+                "2", "spawn", sys.executable, HELPER, "127.0.0.1:0", "127.0.0.1:9", "-", "-", lifeline, *DATA
+            )
+        self.assertEqual(got.returncode, 126)
+        self.assertEqual(fields, {})
+
     def test_after_the_network_log_entries_slirp4netns(self):
-        """spawn with pre-bound descriptors, as under slirp4netns."""
-        r, w = os.pipe()  # two real descriptors to stand in for the sockets
+        """spawn with pre-bound sockets, as under slirp4netns."""
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind(("127.0.0.1", 0))
+        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp.bind(udp.getsockname())
+        tcp.listen(4)
         try:
-            os.dup2(r, 88)
-            os.dup2(w, 89)
+            os.dup2(udp.fileno(), 88)
+            os.dup2(tcp.fileno(), 89)
             self.assert_all_data_arrive(
-                "2",
-                "note",
-                "MARK",
                 "2",
                 "spawn",
                 sys.executable,
                 HELPER,
-                "127.0.0.1:5398",
+                "127.0.0.1:0",
                 "127.0.0.1:9",
                 "88",
                 "89",
+                "-",
+                "2",
+                "note",
+                "MARK",
                 "2",
                 "append",
                 os.devnull,
                 *DATA,
+                pass_fds=(88, 89),
             )
         finally:
-            for fd in (r, w, 88, 89):
+            udp.close()
+            tcp.close()
+            for fd in (88, 89):
                 try:
                     os.close(fd)
                 except OSError:
