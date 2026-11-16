@@ -2614,8 +2614,6 @@ _net_session_dir() {
 #             │    sandbox): reads the netlog FIFO, writes one record per
 #             │    connection to the tool; once the launcher (pasta) has gone
 #             │    writes the end record and removes the session directory.
-#             │    Without Python: _net_log_supervisor, which copies pasta's
-#             │    lines as they are.
 #             └─ exec env -i ... pasta --debug ... 2>>FIFO
 #                  -- relay (prints a marker, reopens its stderr) -- bwrap ...
 #
@@ -2635,23 +2633,24 @@ _net_session_dir() {
 #   - It never blocks pasta: if the tool dies, or stays alive but stops
 #     reading, it goes on reading and drops the lines (a queue bounded in
 #     bytes and a writer thread; the tool is killed at the end if it still has not taken
-#     what is queued).  That is the condenser, with Python.  The bash
-#     supervisor below writes to the tool synchronously, so a tool that stops
-#     reading stalls it, and with it pasta.
+#     what is queued).
 #   - pasta's startup lines would otherwise print on the terminal; the relay
 #     prints a marker on the FIFO and then reopens the user's stderr by path
-#     (a terminal or a file), or through a second FIFO that the supervisor
+#     (a terminal or a file), or through a second FIFO that the reader
 #     copies to it (a pipe).  If pasta exits before the marker (a failed
 #     start), the reader prints its lines on the terminal, so its errors are
 #     not lost.
+#   - The log is not optional in a private network: without Python 3.6 (or
+#     the helper), or when the condenser does not start, the launch stops
+#     (_net_log_abort) instead of running unlogged.
 # slirp4netns has no flow log, so with it the records are the start, the end
 # and the DNS relay's lookups -- which are then the only account of what the
 # sandbox reached for, and the reason the relay is not left to pasta.  The
 # FIFO, the reader and the marker work as above, with the identity mapper
 # (_NET_NS_IDENTITY) in pasta's place as the launcher's exec and as the
 # writer of whatever is said before the marker.  With --share-net there is
-# no namespace to relay in: only start and end are written and the
-# supervisor just waits for the end.
+# no namespace to relay in: only start and end are written, the end by
+# _net_log_supervisor, which just waits for the launcher to go.
 
 _NET_LOG_TAG="bwrap-net"
 # Condenser and DNS relay (lib/bwrap_netlog.py), and the relay's address in
@@ -2666,9 +2665,13 @@ _NET_DNS_RELAY_PORT=53
 # descriptors; _bwrap_fd_* allocates below them.
 _NET_FD_DNS_UDP=88
 _NET_FD_DNS_TCP=89
-# 1 when the log needs the FIFO, the supervisor and the condenser: pasta's
-# flow log, the DNS relay, or both.
+# 1 when the log needs the FIFO and the condenser: in a private network,
+# for pasta's flow log, the DNS relay, or both.
 _NET_LOG_PIPE=0
+# The condenser's pid while the launcher still runs (for _net_log_abort), and
+# how long (seconds) the launcher waits for it to say it is ready.
+_NET_LOG_COND_PID=""
+_NET_LOG_READY_WAIT=10
 _NET_LOG_TOOL=""
 _NET_LOG_TOOLS=()
 _NET_LOG_SESSION=""
@@ -2702,20 +2705,24 @@ _net_log_detect() {
     _NET_LOG_TOOL="${_NET_LOG_TOOLS[0]:-}"
     _NET_LOG_FLOWS=0
     [[ -z "${_NET_LOG_TOOL}" || "${_NET_BACKEND}" != pasta ]] || _NET_LOG_FLOWS=1
-    # With Python the flow log is condensed (one line per open and close)
-    # and the DNS relay names the destinations; without it pasta's lines go
-    # to the log as they are.  The relay runs inside the sandbox's network
-    # namespace and forwards to whatever DNS the backend provides, so it is
-    # not pasta-only: with slirp4netns, which has no flow log, the lookups
-    # are the only record of what the sandbox reached for.
+    # In a private network the condenser writes the flow log (one line per
+    # open and close) and the DNS relay names the destinations.  Both are
+    # Python; without it the launch stops (_net_log_start).  The relay runs
+    # inside the sandbox's network namespace and forwards to whatever DNS the
+    # backend provides, so it is not pasta-only: with slirp4netns, which has
+    # no flow log, the lookups are the only record of what the sandbox
+    # reached for.
     _NET_LOG_PY=""
     _NET_DNS_RELAY=0
-    if [[ -n "${_NET_LOG_TOOL}" && "${_NET_PRIVATE}" -eq 1 && -r "${_NET_LOG_HELPER}" ]]; then
-        _NET_LOG_PY="$(_net_python)"
-        [[ -z "${_NET_LOG_PY}" ]] || _NET_DNS_RELAY=1
-    fi
     _NET_LOG_PIPE=0
-    [[ "${_NET_LOG_FLOWS}" -eq 0 && "${_NET_DNS_RELAY}" -eq 0 ]] || _NET_LOG_PIPE=1
+    if [[ -n "${_NET_LOG_TOOL}" && "${_NET_PRIVATE}" -eq 1 ]]; then
+        _NET_LOG_PIPE=1
+        _NET_DNS_RELAY=1
+        if [[ -r "${_NET_LOG_HELPER}" ]]; then
+            _net_python
+            _NET_LOG_PY="${_NET_PYTHON}"
+        fi
+    fi
     SANDBOX_ENV+=("BWRAP_SESSION=${_NET_LOG_SESSION}")
 }
 
@@ -2771,12 +2778,12 @@ _net_log_record() {
 # _net_log_start
 #   Called by launch_sandbox just before it execs: write the start record
 #   (which checks the tool; without one, warn and log nothing), then with
-#   pasta add --debug and the stderr hand-over, and start the reader (the
-#   condenser, or without Python the supervisor), waiting until it has the
-#   FIFO open.
+#   pasta add --debug and the stderr hand-over, and start the condenser,
+#   waiting until it has the FIFO open.  In a private network the launch
+#   stops when the condenser cannot run (see _net_log_abort).  With
+#   --share-net only the supervisor is started.
 _net_log_start() {
     local _err _launcher="${0##*/}" _t _ready _rfd
-    local -a _relay_orig=()
     _NET_LOG_TOOL=""
     if [[ "${_NET_BACKEND}" == pasta ]]; then
         _NET_LOG_PASTA_VERSION="$("${_PASTA_BIN}" --version 2> /dev/null | awk 'NR == 1 { print $2 }' || true)"
@@ -2795,6 +2802,7 @@ _net_log_start() {
         printf '         this network session is not logged.\n' >&2
         _NET_LOG_TOOL=""
         _NET_LOG_FLOWS=0
+        _NET_LOG_PIPE=0
         _NET_LOG_PY=""
         return 0
     fi
@@ -2802,6 +2810,14 @@ _net_log_start() {
         printf '%s: network log: %s, tag %s, session %s\n' "${_launcher}" \
             "$([[ "${_NET_LOG_TOOL}" == systemd-cat ]] && echo journal || echo syslog)" \
             "${_NET_LOG_TAG}" "${_NET_LOG_SESSION}" >&2
+    fi
+    if [[ "${_NET_LOG_PIPE}" -eq 1 && -z "${_NET_LOG_PY}" ]]; then
+        if [[ ! -r "${_NET_LOG_HELPER}" ]]; then
+            _net_log_abort helper-missing "cannot read ${_NET_LOG_HELPER}, which logs the network session."
+        fi
+        _net_log_abort no-python \
+            "the network log needs Python 3.6 or later (python3, or /usr/libexec/platform-python on RHEL 8)." \
+            "Install it, or use --share-net (which logs only the start and end of the session)."
     fi
 
     if [[ "${_NET_LOG_PIPE}" -eq 1 ]]; then
@@ -2825,8 +2841,6 @@ _net_log_start() {
             mkfifo -m 0600 "${_NET_LOG_ERR_FIFO}"
             _err="${_NET_LOG_ERR_FIFO}"
         fi
-        # Kept so that a reader that fails to start can undo the hand-over.
-        _relay_orig=(${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"})
         local -a _pre=(2 note "${_NET_LOG_MARKER}")
         if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
             # The DNS relay, started by the descriptor relay in the sandbox's
@@ -2842,53 +2856,67 @@ _net_log_start() {
             _pre+=(2 spawn "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}" "${_udp}" "${_tcp}")
         fi
         _BWRAP_FD_RELAY=("${_pre[@]}" 2 append "${_err}" ${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"})
-    fi
-
-    if [[ "${_NET_LOG_PIPE}" -eq 1 && -n "${_NET_LOG_PY}" ]]; then
-        # The condenser reads the FIFO: pasta's flows, the DNS relay's
-        # lookups, or both.  It says "ready" on descriptor 3 once it has it
-        # open, so that nothing written to it is lost; its stderr is the
-        # user's, for what the backend said if the start fails.
-        local -a _cond=("${_NET_LOG_PY}" -I -S "${_NET_LOG_HELPER}" condense
-            --session "${_NET_LOG_SESSION}" --user "${_NET_LOG_USER}" --dns-forward "${_NET_DNS_FORWARD_ADDR}"
-            --fifo "${_NET_LOG_FIFO}" --parent "$$" --marker "${_NET_LOG_MARKER}"
-            --end-record "$(_net_log_record end)" --session-dir "${_NET_SESSION_DIR}"
-            --backend "${_NET_BACKEND}")
-        [[ -z "${_NET_LOG_ERR_FIFO}" ]] || _cond+=(--stderr-fifo "${_NET_LOG_ERR_FIFO}")
-        exec {_rfd}< <(exec setsid "${_cond[@]}" -- "${_NET_LOG_CMD[@]}" 3>&1 > /dev/null < /dev/null)
-        IFS= read -r -t 10 _ready <&"${_rfd}" || _ready=""
-        exec {_rfd}<&-
-        if [[ "${_ready}" != ready ]]; then
-            printf 'Warning: %s: the network log condenser did not start; connections and\n' "${_launcher}" >&2
-            printf '         lookups are not logged for this session.\n' >&2
-            # Keep the backend's stderr off a FIFO no one reads, and take
-            # back the relay's hand-over: with no FIFO its marker, and the
-            # DNS relay's lines, would land on the user's terminal.
-            _NET_LOG_FIFO=""
-            _NET_LOG_FLOWS=0
-            _NET_DNS_RELAY=0
-            _NET_LOG_PIPE=0
-            _BWRAP_FD_RELAY=(${_relay_orig[@]+"${_relay_orig[@]}"})
-            # No reader is left to remove the session directory, and its
-            # FIFOs would make it look owned (see _net_slirp_start): remove
-            # it now; slirp4netns makes a fresh one if it needs one.
-            rm -rf -- "${_NET_SESSION_DIR}"
-            _NET_SESSION_DIR=""
-            _NET_LOG_ERR_FIFO=""
-        fi
+    else
+        # --share-net: no FIFO, only the end record to write.
+        _net_log_supervisor &
         return 0
     fi
-    _net_log_supervisor &
+
+    # The condenser reads the FIFO: pasta's flows, the DNS relay's lookups,
+    # or both.  It says "ready" on descriptor 3 once it has it open, so that
+    # nothing written to it is lost; its stderr is the user's, for what the
+    # backend said if the start fails.
+    local -a _cond=("${_NET_LOG_PY}" -I -S "${_NET_LOG_HELPER}" condense
+        --session "${_NET_LOG_SESSION}" --user "${_NET_LOG_USER}" --dns-forward "${_NET_DNS_FORWARD_ADDR}"
+        --fifo "${_NET_LOG_FIFO}" --parent "$$" --marker "${_NET_LOG_MARKER}"
+        --end-record "$(_net_log_record end)" --session-dir "${_NET_SESSION_DIR}"
+        --backend "${_NET_BACKEND}")
+    [[ -z "${_NET_LOG_ERR_FIFO}" ]] || _cond+=(--stderr-fifo "${_NET_LOG_ERR_FIFO}")
+    exec {_rfd}< <(exec setsid "${_cond[@]}" -- "${_NET_LOG_CMD[@]}" 3>&1 > /dev/null < /dev/null)
+    # setsid does not fork here (the process substitution is not a process
+    # group leader), so $! is the condenser itself.
+    _NET_LOG_COND_PID="$!"
+    IFS= read -r -t "${_NET_LOG_READY_WAIT}" _ready <&"${_rfd}" || _ready=""
+    exec {_rfd}<&-
+    if [[ "${_ready}" != ready ]]; then
+        _net_log_abort condenser-failed \
+            "the network log condenser did not start, so connections and lookups could not be logged." \
+            "Check that ${_NET_LOG_PY} can run ${_NET_LOG_HELPER}."
+    fi
+}
+
+# _net_log_abort REASON MESSAGE [MORE...]
+#   The network log cannot run: stop the launch before the backend starts.
+#   Ends a condenser that did start, writes an abort record (the start record
+#   is already in the log), removes the session directory and exits 3, like
+#   the other failures to set up the private network.  MESSAGE is the first
+#   line of the error; each further argument is a line of its own.
+_net_log_abort() {
+    local _reason="$1" _l
+    shift
+    if [[ -n "${_NET_LOG_COND_PID}" && "$(_net_ppid "${_NET_LOG_COND_PID}")" == "$$" ]]; then
+        kill -KILL "${_NET_LOG_COND_PID}" 2> /dev/null || true
+    fi
+    _NET_LOG_COND_PID=""
+    if [[ -n "${_NET_LOG_TOOL}" ]]; then
+        printf 'event=abort session=%s launcher=%s user=%s reason=%s\n' "${_NET_LOG_SESSION}" "${0##*/}" \
+            "${_NET_LOG_USER}" "${_reason}" | "${_NET_LOG_CMD[@]}" > /dev/null 2>&1 || true
+    fi
+    [[ -z "${_NET_SESSION_DIR}" ]] || rm -rf -- "${_NET_SESSION_DIR}"
+    printf 'Error: %s: %s\n' "${0##*/}" "$1" >&2
+    shift
+    for _l in "$@"; do
+        printf '       %s\n' "${_l}" >&2
+    done
+    exit 3
 }
 
 # _net_log_supervisor
-#   The background half of the network log without Python (see "Network
-#   log"): copies pasta's lines as they are, prefixed with the session, or
-#   without pasta just waits for the end.  Runs in a subshell; $$ is still
-#   the launcher, which is pasta (or bwrap) by then.
+#   The background half of the network log with --share-net (see "Network
+#   log"): waits for the launcher to go and writes the end record.  Runs in a
+#   subshell; $$ is still the launcher, which is bwrap by then.
 _net_log_supervisor() {
-    local _sink _prefix _fifo _line="" _part="" _rc _started=0 _dead=0 _bridge="" _i
-    local -a _early=()
+    local _sink
     set +e
     # Signals meant for the session (Ctrl-C, a hangup, `kill` of its process
     # group) must not cost the end record: the supervisor ends by itself once
@@ -2896,76 +2924,11 @@ _net_log_supervisor() {
     trap '' INT QUIT TSTP HUP TERM PIPE
     exec < /dev/null > /dev/null
     exec {_sink}> >(exec setsid "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
-    _prefix="session=${_NET_LOG_SESSION} user=${_NET_LOG_USER} "
-
-    if [[ "${_NET_LOG_PIPE}" -eq 1 ]]; then
-        # Read-write, so end-of-file is never seen before pasta writes.  This
-        # descriptor is the supervisor's alone; the launcher's own hold on
-        # the FIFO is closed before it execs pasta (see launch_sandbox).
-        # Without Python there is no DNS relay, so here the FIFO only ever
-        # carries pasta's flows.
-        exec {_fifo}<> "${_NET_LOG_FIFO}"
-        if [[ -n "${_NET_LOG_ERR_FIFO}" ]]; then
-            cat < "${_NET_LOG_ERR_FIFO}" >&2 &
-            _bridge=$!
-        fi
-        while :; do
-            # Poll faster until the sandbox has started, so a failed pasta
-            # start is reported promptly.
-            IFS= read -r -t "$([[ "${_started}" -eq 1 ]] && echo 1 || echo 0.1)" _line <&"${_fifo}"
-            _rc=$?
-            if ((_rc > 128)); then
-                # Timeout; a partial line stays in _line.
-                _part+="${_line}"
-                _net_launcher_alive || break
-                continue
-            fi
-            _line="${_part}${_line}"
-            _part=""
-            if [[ "${_started}" -eq 0 ]]; then
-                if [[ "${_line}" == "${_NET_LOG_MARKER}" ]]; then
-                    _started=1
-                    _early=()
-                    continue
-                fi
-                [[ ${#_early[@]} -ge 200 ]] || _early+=("${_line}")
-            fi
-            if [[ "${_dead}" -eq 0 ]] &&
-                ! printf '%s%s\n' "${_prefix}" "${_line}" 1>&"${_sink}" 2> /dev/null; then
-                _dead=1
-            fi
-        done
-        # pasta has exited: drain what it left in the pipe.
-        while IFS= read -r -t 0.2 _line <&"${_fifo}"; do
-            [[ "${_dead}" -eq 1 ]] ||
-                printf '%s%s\n' "${_prefix}" "${_part}${_line}" 1>&"${_sink}" 2> /dev/null || _dead=1
-            _part=""
-        done
-        exec {_fifo}<&-
-        if [[ "${_started}" -eq 0 ]]; then
-            # The namespace stopped before starting the sandbox: show what it
-            # said (pasta's own messages, or the descriptor relay's).
-            for _line in ${_early[@]+"${_early[@]}"}; do
-                printf '%s: %s: %s\n' "${0##*/}" "${_NET_BACKEND}" "${_line}" >&2
-            done
-        fi
-        if [[ -n "${_bridge}" ]]; then
-            for ((_i = 0; _i < 50; _i++)); do
-                kill -0 "${_bridge}" 2> /dev/null || break
-                sleep 0.1
-            done
-            kill "${_bridge}" 2> /dev/null
-        fi
-    else
-        while _net_launcher_alive; do
-            sleep 1
-        done
-    fi
-    if [[ "${_dead}" -eq 0 ]]; then
-        _net_log_record end 1>&"${_sink}" 2> /dev/null
-    fi
+    while _net_launcher_alive; do
+        sleep 1
+    done
+    _net_log_record end 1>&"${_sink}" 2> /dev/null
     exec {_sink}>&-
-    [[ -z "${_NET_SESSION_DIR}" ]] || rm -rf "${_NET_SESSION_DIR}"
     exit 0
 }
 
@@ -3007,15 +2970,19 @@ _net_log_print_dry_run() {
         printf '# relay reopens yours (%s has no flow log: the FIFO carries the DNS relay'"'"'s\n' "${_NET_BACKEND}"
         printf '# lines).  The end record is written when the sandbox exits.\n'
     else
-        printf '# and a supervisor writes the end record when the sandbox exits (no flow log\n'
-        printf '# with %s).\n' "${_NET_BACKEND}"
+        printf '# and a supervisor writes the end record when the sandbox exits (no flow or\n'
+        printf '# DNS log with --share-net).\n'
     fi
-    if [[ "${_NET_LOG_PIPE}" -eq 1 && -n "${_NET_LOG_PY}" ]]; then
+    if [[ "${_NET_LOG_PIPE}" -eq 1 && -z "${_NET_LOG_PY}" ]]; then
+        printf '# The condenser needs Python 3.6 or later and %s:\n' "${_NET_LOG_HELPER}"
+        printf '# one is missing, so a real launch stops (exit 3).\n'
+        return 0
+    fi
+    if [[ "${_NET_LOG_PIPE}" -eq 1 ]]; then
         printf '# The FIFO is read, and the lines condensed (one per connection opened and\n'
         printf '# closed, one per lookup), by\n'
         printf '#   %s -I %s condense --fifo <session dir>/netlog ...\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}"
-    elif [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
-        printf '# A supervisor copies each line to the log as it is.\n'
+        printf '# If it does not start, a real launch stops (exit 3).\n'
     fi
     if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
         printf '# The descriptor relay starts the DNS relay on %s:%s in the namespace:\n' \
@@ -3230,14 +3197,21 @@ os.execvp(cmd[0], cmd)
 '
 
 # _net_python
-#   Print the Python used by the network helpers (RHEL 8's platform-python,
-#   else python3), nothing when there is none.  They need the standard
-#   library of Python 3.6 or later only.
+#   Set _NET_PYTHON to the Python used by the network helpers (RHEL 8's
+#   platform-python, else python3), empty when there is none.  They need the
+#   standard library of Python 3.6 or later only; an older one counts as
+#   none.  The answer is kept, so the version is checked once per launch.
+_NET_PYTHON=""
+_NET_PYTHON_DONE=0
 _net_python() {
     local _p
+    [[ "${_NET_PYTHON_DONE}" -eq 0 ]] || return 0
+    _NET_PYTHON_DONE=1
+    _NET_PYTHON=""
     for _p in /usr/libexec/platform-python "$(command -v python3 2> /dev/null || true)"; do
-        if [[ -n "${_p}" && -x "${_p}" ]]; then
-            printf '%s' "${_p}"
+        if [[ -n "${_p}" && -x "${_p}" ]] &&
+            "${_p}" -I -S -c 'import sys; sys.exit(sys.version_info < (3, 6))' > /dev/null 2>&1; then
+            _NET_PYTHON="${_p}"
             return 0
         fi
     done
@@ -3258,9 +3232,10 @@ _net_try_slirp() {
     fi
     # Python creates the namespaces (_NET_NS_IDENTITY) and, for --publish,
     # drives the API socket.  Needed for every launch, not only --publish.
-    _NET_PY_BIN="$(_net_python)"
+    _net_python
+    _NET_PY_BIN="${_NET_PYTHON}"
     if [[ -z "${_NET_PY_BIN}" ]]; then
-        _NET_TRY_REASON="needs python3 (or /usr/libexec/platform-python) to create the namespaces"
+        _NET_TRY_REASON="needs Python 3.6 or later (python3 or /usr/libexec/platform-python) to create the namespaces"
         return 1
     fi
     if ! _out="$("${_SLIRP_BIN}" --version 2>&1)"; then
